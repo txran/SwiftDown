@@ -75,7 +75,6 @@ struct RootView: View {
                                    fontSize: settings.fontSize,
                                    fontFamily: settings.fontFamily,
                                    showLineNumbers: settings.showLineNumbers)
-                            .id(tab.id)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
                     if workspace.viewMode == .split {

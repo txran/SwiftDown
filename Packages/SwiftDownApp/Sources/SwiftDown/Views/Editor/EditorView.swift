@@ -67,6 +67,7 @@ struct EditorView: NSViewRepresentable {
         coordinator.ruler = ruler
         coordinator.scrollView = scrollView
         coordinator.revision = tab.revision
+        coordinator.tabID = tab.id
         coordinator.observeScroll()
 
         MarkdownHighlighter.apply(to: storage ?? NSTextStorage(), theme: theme)
@@ -76,6 +77,17 @@ struct EditorView: NSViewRepresentable {
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         let coordinator = context.coordinator
         coordinator.parent = self
+
+        // 切换标签：**复用**同一个 NSTextView，只替换内容。
+        // 此前 RootView 上挂了 `.id(tab.id)`，打开/切换文件时 SwiftUI 会销毁重建
+        // 整个 NSViewRepresentable —— 新建 NSTextView + 全量布局 + 重新高亮，
+        // 编辑区先出现一段空白再填字（肉眼就是「闪一下」），顺带丢掉滚动位置与撤销栈。
+        if coordinator.tabID != tab.id {
+            coordinator.tab = tab
+            coordinator.switchDocument(to: tab)
+            return
+        }
+
         coordinator.tab = tab
         guard let textView = coordinator.textView else { return }
 
@@ -140,6 +152,8 @@ struct EditorView: NSViewRepresentable {
         weak var scrollView: NSScrollView?
 
         var revision: Int = -1
+        /// 当前视图承载的文档标识；与 tab.id 不一致即说明要换文档而不是换视图
+        var tabID: UUID?
         var lastJumpToken: Int = 0
         var theme: EditorTheme
         var fontName: String
@@ -160,6 +174,37 @@ struct EditorView: NSViewRepresentable {
             self.theme = theme
             self.fontName = theme.baseFont.fontName
             super.init()
+        }
+
+        /// 把同一个文本视图切到另一份文档
+        func switchDocument(to tab: DocumentTab) {
+            guard let textView else { return }
+            // 必须先记下新文档标识：漏了这行，切走再切回时会被判定为「无需切换」，
+            // 编辑区就停在上一篇内容上（自检 `FR-04 切回标签内容正确` 抓到的就是这个）。
+            tabID = tab.id
+            highlightWork?.cancel()
+            pendingLineWork?.cancel()
+            pendingLine = nil
+            revision = tab.revision
+            lastJumpToken = tab.jumpToken
+            lastReportedLine = 1
+
+            // 复用同一个 NSTextView 后，撤销栈会跨文档残留：
+            // 不清空的话，在新文档里按 ⌘Z 会把上一篇的内容撤回来（等于串档写坏文件）。
+            textView.undoManager?.removeAllActions()
+
+            textView.replaceEntireText(with: tab.text, theme: theme)
+            if let storage = textView.textStorage {
+                MarkdownHighlighter.apply(to: storage, theme: theme)
+            }
+            textView.isEditable = !tab.isReadOnly && tab.session.isEditable
+            textView.setSelectedRange(NSRange(location: 0, length: 0))
+            textView.needsDisplay = true
+
+            ruler?.invalidateLineIndex()
+            ruler?.needsDisplay = true
+            scrollView?.contentView.scroll(to: .zero)
+            if let clip = scrollView?.contentView { scrollView?.reflectScrolledClipView(clip) }
         }
 
         func teardown() {

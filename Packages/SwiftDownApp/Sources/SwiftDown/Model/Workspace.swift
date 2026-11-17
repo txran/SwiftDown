@@ -171,7 +171,9 @@ final class Workspace: ObservableObject {
         // FR-01：重复打开同一文件 → 聚焦已有标签，不新建
         if let existing = tabs.first(where: { $0.url.standardizedFileURL == target }) {
             activate(existing)
-            NSApp.activate(ignoringOtherApps: true)
+            // 已经在前台时不要重复激活：每次 activate 都会让系统重新排序/重绘窗口，
+            // 视觉上就是一次不必要的闪动
+            if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }
             return
         }
 
