@@ -41,17 +41,17 @@
 
 不想自己编译就直接下发行版：[**Releases**](https://gitee.com/txran/swift-down/releases)
 
-当前版本 **0.1.0**：[发行说明](https://gitee.com/txran/swift-down/releases/tag/v0.1.0)
+当前版本 **0.1.1**：[发行说明](https://gitee.com/txran/swift-down/releases/tag/v0.1.1)
 
 | 文件 | 用法 |
 |---|---|
-| [`SwiftDown-0.1.0-arm64.dmg`](https://gitee.com/txran/swift-down/releases/download/v0.1.0/SwiftDown-0.1.0-arm64.dmg) | 打开后把 SwiftDown 拖进「应用程序」 |
-| [`SwiftDown-0.1.0-arm64.zip`](https://gitee.com/txran/swift-down/releases/download/v0.1.0/SwiftDown-0.1.0-arm64.zip) | 解压即用，适合脚本化下载 |
+| [`SwiftDown-0.1.1-arm64.dmg`](https://gitee.com/txran/swift-down/releases/download/v0.1.1/SwiftDown-0.1.1-arm64.dmg) | 打开后把 SwiftDown 拖进「应用程序」 |
+| [`SwiftDown-0.1.1-arm64.zip`](https://gitee.com/txran/swift-down/releases/download/v0.1.1/SwiftDown-0.1.1-arm64.zip) | 解压即用，适合脚本化下载 |
 
 ```bash
 # 命令行安装（不想拖拽时）
 curl -L -o /tmp/SwiftDown.zip \
-  https://gitee.com/txran/swift-down/releases/download/v0.1.0/SwiftDown-0.1.0-arm64.zip
+  https://gitee.com/txran/swift-down/releases/download/v0.1.1/SwiftDown-0.1.1-arm64.zip
 ditto -x -k /tmp/SwiftDown.zip /Applications
 xattr -dr com.apple.quarantine /Applications/SwiftDown.app
 ```
@@ -126,7 +126,7 @@ Packages/
 │                         唯一写盘入口，冲突期写入冻结（23 个单测）
 ├── SwiftDownPipeline/    Markdown 解析：swift-markdown → 与渲染无关的抽象 AST（18 个单测）
 ├── SwiftDownEditorKit/   编辑器内核：分块行索引、差量撤销、语法辅助（25 个单测）
-└── SwiftDownApp/         SwiftUI 壳 + AppKit 编辑渲染 + 自检与出图（65 项端到端断言）
+└── SwiftDownApp/         SwiftUI 壳 + AppKit 编辑渲染 + 自检与出图（72 项端到端断言）
 ```
 
 设计取舍见 [SwiftDown-Design.md](SwiftDown-Design.md) 的 ADR 列表（文本引擎、行索引、冲突写入冻结、模态呈现约束等）。
@@ -144,7 +144,7 @@ swift test --disable-sandbox \
 
 `--disable-sandbox` 是必需的：SPM 的插件沙箱在没有完整 Xcode 的环境下会拒绝加载 swift-testing 宏插件。
 
-端到端自检（每次改动后跑一遍，输出 65 项 PASS/FAIL）：
+端到端自检（每次改动后跑一遍，输出 72 项 PASS/FAIL）：
 
 ```bash
 ./Scripts/build-app.sh release
