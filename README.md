@@ -4,6 +4,8 @@
 
 原生 Swift + SwiftUI + AppKit，无第三方 UI 框架；启动快、占用小，专注「打开就能写」。
 
+> 主仓库在 [Gitee](https://gitee.com/txran/swift-down)，[GitHub](https://github.com/txran/SwiftDown) 为镜像，两边内容同步。
+
 ![SwiftDown 分屏界面](Docs/screenshot-split.png)
 
 ## 特性
