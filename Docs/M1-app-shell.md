@@ -400,3 +400,35 @@ SwiftDown --trace --start A.md --trace-open B.md
 ```
 
 正常启动不传这些参数时是空操作，零开销。
+
+### 第九轮：为什么「应用程序」里有两次 SwiftDown
+
+反馈：`/Applications` 里只有一个 app，但应用列表里出现两个图标。
+
+排查顺序（先看系统怎么看，而不是先看文件夹）：
+
+```bash
+ls -ld /Applications/SwiftDown*.app                    # 只有一个
+mdfind "kMDItemCFBundleIdentifier == 'dev.swiftdown.app'"
+#   /Users/txran/Documents/LearningSpace/SwiftDown/build/SwiftDown.app
+#   /Applications/SwiftDown.app
+```
+
+两条命中，版本都是 0.1.2、bundle id 一模一样、图标一样。原因不在文件夹，而在**身份**：
+两个 bundle 共用同一个 `CFBundleIdentifier`，LaunchServices 把它们当成同一个应用的两份。
+另外 `lsregister -dump` 显示积累过 108 条注册记录（历史测试反复复制、`lsregister -f` 留下，含指向已删路径的僵尸项）。
+
+修法与实测依据：
+
+| 措施 | 验证 |
+|---|---|
+| 开发构建改身份 `dev.swiftdown.app.dev` / 名「SwiftDown Dev」 | `PlistBuddy` 核对两个产物 id 不同 |
+| 产物移入 `build/.dev/` | `mdimport` 后 `mdfind -onlyin build/.dev` 为空；同目录下的普通目录对照组有结果 |
+| `build/SwiftDown.app` 改为符号链接 | 链接路径同样不被索引，`open` / `--selftest` 走链接一切正常 |
+| `package-app.sh` 传 `SWIFTDOWN_DIST=1` | 打包产物仍是正式身份，装到「应用程序」只覆盖那一份 |
+| 删除 `/tmp` 测试副本 + `lsregister -u` 注销失效路径 | `mdfind` 只剩 `/Applications` 一条 |
+
+脚本上踩到一个坑：`echo "…$APP_LINK（符号链接…）"` 里变量紧跟全角括号，bash 把 `（` 当成变量名的一部分，
+报 `APP_LINK?: unbound variable`。写成 `${APP_LINK}` 或让括号不紧跟变量。
+
+自检仍为 72 项全 PASS（开发版走新身份、走符号链接路径都能通过）。

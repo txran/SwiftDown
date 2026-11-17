@@ -81,6 +81,12 @@ open build/SwiftDown.app
 
 调试构建：`./Scripts/build-app.sh debug`
 
+> **开发构建叫「SwiftDown Dev」**，bundle id 是 `dev.swiftdown.app.dev`，与从发行包装到
+> 「应用程序」里的 `SwiftDown`（`dev.swiftdown.app`）是两个独立应用。真实产物放在
+> `build/.dev/`，`build/SwiftDown.app` 只是指向它的符号链接。
+> 这样做是为了避免两个同名同图标、同 bundle id 的副本同时被系统登记（会导致「应用程序」里
+> 出现两个图标、⌘Tab 里出现两个同款图标、以及「打开方式」指向不确定的那一份）。
+
 要发给别人用的发行包（产出 `.dmg` 与 `.zip` 到 `build/dist/`）：
 
 ```bash

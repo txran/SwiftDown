@@ -10,11 +10,15 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-APP="$ROOT/build/SwiftDown.app"
+# 用真实产物路径，不要用 build/SwiftDown.app 这个符号链接：
+# ditto 遇到链接会打成「链接」而不是整个 bundle，解压出来是坏的。
+APP="$ROOT/build/.dev/SwiftDown.app"
 DIST="$ROOT/build/dist"
 
 cd "$ROOT"
-./Scripts/build-app.sh release
+# 发行包必须用正式身份（dev.swiftdown.app），不能带 build-app.sh 的开发身份，
+# 否则装到「应用程序」里会变成两个不同 id 的 SwiftDown。
+SWIFTDOWN_DIST=1 ./Scripts/build-app.sh release
 
 VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Contents/Info.plist")
 ARCH=$(uname -m)

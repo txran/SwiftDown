@@ -349,6 +349,30 @@ FAIL，已验证断言有效），并配「标尺随位数变宽 46→50」「�
 
 ---
 
+**ADR-15 开发产物用独立身份，并放进隐藏目录**（第九轮，用户反馈「应用程序里出现两个图标」）
+
+现象：`/Applications` 里明明只有一个 `SwiftDown.app`，「应用程序」（Spotlight 驱动的应用列表）却显示两个同名同图标入口。
+
+实测依据：`mdfind "kMDItemCFBundleIdentifier == 'dev.swiftdown.app'"` 返回两条——
+`/Applications/SwiftDown.app` 与项目里的 `build/SwiftDown.app`，版本同为 0.1.2、bundle id 完全相同、图标相同；
+LaunchServices 里还累积了 108 条注册记录（多轮复制与 `lsregister` 测试留下，其中数条指向已删除路径）。
+
+结论：两个 `.app` bundle 共用同一个 `CFBundleIdentifier` 时，系统视其为「同一应用的两份」，
+应用列表、⌘Tab、「打开方式」都会出现重复项或指向不确定的那一份。
+
+修正分三层：
+
+1. **开发构建换身份**：`dev.swiftdown.app.dev`、显示名「SwiftDown Dev」；`package-app.sh` 传 `SWIFTDOWN_DIST=1`，
+   打包产物保持正式身份 `dev.swiftdown.app`。
+2. **产物落在 `build/.dev/SwiftDown.app`**。实测确认 Spotlight 跳过以 `.` 开头的目录，也不索引指向它的符号链接；
+   `build/SwiftDown.app` 保留为符号链接，README 与既有脚本路径不用改。
+3. 清掉测试期遗留的临时副本，并用 `lsregister -u` 注销失效路径。
+
+副作用：开发版换 id 后 UserDefaults 是新的域（主题、最近打开不继承）。这是预期的——
+若继续共用域，系统又会把它当成同一个应用。
+
+---
+
 **通用结论**：凡是渲染类能力，自检断言必须落到**内容**（编号数组 / 像素），只断言「视图对象存在」是无效断言；且自检不得改动被测对象的内部状态（见 ADR-09）。
 若要手工装配 `NSTextContentStorage` + `NSTextLayoutManager` 而不经 `NSTextView` 默认路径，会牵动高亮层对 `NSTextStorage` 的直接写入，M1 不做，留 M2 评估。
 
