@@ -39,10 +39,20 @@
 
 不想自己编译就直接下发行版：[**Releases**](https://gitee.com/txran/swift-down/releases)
 
+当前版本 **0.1.0**：[发行说明](https://gitee.com/txran/swift-down/releases/tag/v0.1.0)
+
 | 文件 | 用法 |
 |---|---|
-| `SwiftDown-0.1.0-arm64.dmg` | 打开后把 SwiftDown 拖进「应用程序」 |
-| `SwiftDown-0.1.0-arm64.zip` | 解压即用，适合脚本化下载 |
+| [`SwiftDown-0.1.0-arm64.dmg`](https://gitee.com/txran/swift-down/releases/download/v0.1.0/SwiftDown-0.1.0-arm64.dmg) | 打开后把 SwiftDown 拖进「应用程序」 |
+| [`SwiftDown-0.1.0-arm64.zip`](https://gitee.com/txran/swift-down/releases/download/v0.1.0/SwiftDown-0.1.0-arm64.zip) | 解压即用，适合脚本化下载 |
+
+```bash
+# 命令行安装（不想拖拽时）
+curl -L -o /tmp/SwiftDown.zip \
+  https://gitee.com/txran/swift-down/releases/download/v0.1.0/SwiftDown-0.1.0-arm64.zip
+ditto -x -k /tmp/SwiftDown.zip /Applications
+xattr -dr com.apple.quarantine /Applications/SwiftDown.app
+```
 
 - **仅 Apple Silicon（arm64）**，macOS 13+；Intel 机器请按下面的方式自行编译。
 - 发行包是 ad-hoc 签名（无开发者证书）。首次打开被拦时：访达里右键 → 打开；
