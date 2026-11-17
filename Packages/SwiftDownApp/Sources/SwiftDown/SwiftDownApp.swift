@@ -14,6 +14,9 @@ final class AppEnvironment: ObservableObject {
            let suite = UserDefaults(suiteName: SelfTest.settingsSuiteName) {
             suite.removePersistentDomain(forName: SelfTest.settingsSuiteName)
             defaults = suite
+        } else if CommandLine.arguments.contains("--render"),
+                  let suite = UserDefaults(suiteName: RenderJob.suiteName) {
+            defaults = suite
         } else {
             defaults = .standard
         }
@@ -194,6 +197,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             env.workspace.open(urls: pendingURLs)
             pendingURLs.removeAll()
         }
+        // 文档出图（非交互）：--render <md> --out <png> [--size WxH] [--mode editor|split|preview]
+        //                              [--theme light|dark] [--outline 0|1] [--settings general|shortcuts]
+        if let options = RenderJob.parse(CommandLine.arguments) {
+            Task { @MainActor in await RenderJob.run(options) }
+            return
+        }
+
         if let index = CommandLine.arguments.firstIndex(of: "--selftest"), !didRunSelfTest {
             didRunSelfTest = true
             let target = CommandLine.arguments.count > index + 1

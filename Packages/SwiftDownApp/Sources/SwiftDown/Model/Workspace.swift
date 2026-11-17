@@ -106,12 +106,14 @@ final class Workspace: ObservableObject {
     private static let readOnlyThreshold = 20 * 1024 * 1024
 
     init(settings: AppSettings,
-         restoreSessionOnInit: Bool = !CommandLine.arguments.contains("--selftest")) {
+         restoreSessionOnInit: Bool = !CommandLine.arguments.contains("--selftest"),
+         sessionStore: SessionStore? = nil) {
         self.settings = settings
-        // 自检期间会话文件落到临时目录：真实会话文件不能被测试覆盖
-        self.sessionStore = SessionStore(directory: CommandLine.arguments.contains("--selftest")
-                                         ? Self.selftestSessionDirectory
-                                         : nil)
+        // 自检/出图期间会话文件落到临时目录：真实会话文件不能被工具覆盖
+        self.sessionStore = sessionStore
+            ?? SessionStore(directory: CommandLine.arguments.contains("--selftest")
+                            ? Self.selftestSessionDirectory
+                            : nil)
         // 布局来源优先级：
         //   设置了「启动时恢复上次布局」→ 上次会话的布局（无记录则用默认布局）
         //   否则 → 设置里的默认布局

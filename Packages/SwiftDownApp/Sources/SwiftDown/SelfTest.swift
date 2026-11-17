@@ -444,24 +444,12 @@ enum SelfTest {
         print("SELFTEST RESULT: \(failures == 0 ? "ALL PASS" : "\(failures) FAILED")")
     }
 
-    /// 把视图离屏渲染为 PNG（需先放进一个不显示的窗口，SwiftUI 才会真正布局）
+    /// 把视图离屏渲染为 PNG（实现在 `SnapshotRenderer`，与 `--render` 出图共用）
     @MainActor
     private static func snapshotView(_ view: NSView, to path: String, size: NSSize = NSSize(width: 1180, height: 760)) {
-        let window = NSWindow(contentRect: NSRect(origin: .zero, size: size),
-                              styleMask: [.titled],
-                              backing: .buffered,
-                              defer: false)
-        view.frame = NSRect(origin: .zero, size: size)
-        window.contentView = view
-        view.layoutSubtreeIfNeeded()
-        view.displayIfNeeded()
-
-        guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
-        view.cacheDisplay(in: view.bounds, to: rep)
-        guard let data = rep.representation(using: .png, properties: [:]) else { return }
-        try? data.write(to: URL(fileURLWithPath: path))
-        print("[snapshot] \(path) \(Int(rep.pixelsWide))x\(Int(rep.pixelsHigh))")
-        window.contentView = nil
+        if let pixels = SnapshotRenderer.render(view, to: path, size: size) {
+            print("[snapshot] \(path) \(Int(pixels.width))x\(Int(pixels.height))")
+        }
     }
 
     @MainActor
