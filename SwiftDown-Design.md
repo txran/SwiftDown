@@ -297,20 +297,29 @@ PRD 只写了「标签栏支持多标签」，没规定溢出行为。实现上�
 布局判断抽成纯函数（`TabBarMetrics.needsArrows` / `wrappedRowCount`），自检用数字断言，
 渲染结果再用离屏快照兜住观感——这是「能断言的别靠肉眼」的延续。
 
-**ADR-13 不要在 `NSScrollView + NSRulerView` 上做原地换文档**（第六轮反馈后补，结论为「不做」）
-为消除「打开文件闪一下」曾尝试去掉 `EditorView` 的 `.id(tab.id)`，改为复用同一个 `NSTextView`、
-换文档时只替换文本存储。结论是这条路在当前渲染方式下不可行：
-- 换文档后 `NSScrollView` 不重算「行号栏 + 文档区」，文本视图被撑到含行号栏的整宽，
-  首行 `# 文` 被行号栏覆盖（实测 `firstRect` 落在行号栏内部）；`tile()`、重挂 `documentView`、
-  重建 ruler、失效 TextKit2 布局均无法稳定纠正；
-- 在 `updateNSView`（SwiftUI 布局期）里滚动会同步触发 `boundsDidChange` → 写 `tab.focusedLine`，
-  等于布局中途改状态，布局被打回循环，窗口显示动画中断，`kCGWindowAlpha` 停在 0（窗口近乎不可见）；
-- 只有重置 `undoManager` 那条是必须保留的认知：一旦复用视图，撤销栈必须按文档清空，否则 ⌘Z 跨文档串档。
+**ADR-13 换文档靠「复用同一个编辑器实例」，不重建视图**（第七轮修正，推翻第六轮的「不做」结论）
 
-因此保留 `.id(tab.id)`（每份文档一个干净视图）。要真正做到无闪切换，需要先把行号栏从
-`NSRulerView` 换成自绘的边栏视图（与文本视图同处一个容器，自己算行高），这是 M2 的重构项。
-**顺带结论**：用户感知的「闪一下」经连拍验证是 macOS 的应用激活过渡（前台时打开新文件不复现），
-与视图重建无关，不要为此改渲染结构。
+第六轮曾尝试去掉 `.id(tab.id)` 做原地换文档，失败后写下了「这条路不可行」。第七轮重新定位后判定：
+**当时的两个障碍不是结构性的，是可解的**，而「闪一下」的真正来源恰恰就是 `.id(tab.id)`——它让 AppKit
+视图跨一个 CA 事务「先拆后装」，中间必然漏出一帧未挂载的空白。其他编辑器（TextEdit / VS Code / Typora）
+之所以不闪，是因为它们切换文档时**从不销毁编辑器**，只替换文本存储。
+
+现在 `RootView` 不再给 `EditorView` 挂 `.id`，切换由 `EditorView.updateNSView` 的 `tabChanged` 分支
+调用 `Coordinator.adopt(_:)` 完成。第六轮的两个坑及其解法：
+
+- **标尺宽度晚一帧**：`ruleThickness` 原本只在 `drawHashMarksAndLabels` 里更新，于是「标尺变宽」比
+  「文本区重排」晚，换文档（位数 2 → 4）时能看到横向跳动。新增 `LineNumberRulerView.prepareForNewDocument()`，
+  在换内容后**主动**重算宽度，再 `scrollView.layoutSubtreeIfNeeded()`，最后把 `textView.frame` 贴到
+  `contentView.frame.width`。不做最后一步，文本视图会保持旧宽度被标尺压住首行（第六轮的真实翻车点）。
+- **布局期写 @Published**：`boundsDidChange` 与 `textViewDidChangeSelection` 都会同步读位置回写
+  `tab.focusedLine`，而 adopt 正跑在 SwiftUI 布局期，这会把布局打回循环（第六轮就是这样让窗口 alpha 卡在 0）。
+  现在 adopt 期间置 `isAdopting`，两个回调都早退；`focusedLine` 的重置推到下一轮 runloop。
+- **撤销栈必须按文档清空**：旧实现靠视图重建天然清空，复用后必须显式 `removeAllActions()`，否则 ⌘Z 跨文档串档。
+- 其余瞬态状态（选区、滚动位置）在 adopt 里一并复位，行为与「每份文档一个干净视图」等价。
+
+自检不再靠肉眼，而是断言**实例同一性**：切换前后 `NSTextView` 必须 `===`（把 `.id(tab.id)` 加回去会
+FAIL，已验证断言有效），并配「标尺随位数变宽 46→50」「文本区宽度 == clipView 宽度」「切换后行号仍连续」
+三条，把第六轮那两个翻车点变成可回归的断言。
 
 **通用结论**：凡是渲染类能力，自检断言必须落到**内容**（编号数组 / 像素），只断言「视图对象存在」是无效断言；且自检不得改动被测对象的内部状态（见 ADR-09）。
 若要手工装配 `NSTextContentStorage` + `NSTextLayoutManager` 而不经 `NSTextView` 默认路径，会牵动高亮层对 `NSTextStorage` 的直接写入，M1 不做，留 M2 评估。

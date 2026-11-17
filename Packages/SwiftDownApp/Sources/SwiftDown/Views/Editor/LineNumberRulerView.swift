@@ -47,6 +47,18 @@ final class LineNumberRulerView: NSRulerView {
         needsDisplay = true
     }
 
+    /// 换文档时**主动**重算行号栏宽度，不要等下一次 `draw`。
+    ///
+    /// 宽度原本只在 `drawHashMarksAndLabels` 里更新，于是「标尺变宽」比
+    /// 「文本区重排」晚一帧，换文档时能看到一次横向跳动。
+    /// 位数变化（例：12 行 → 1200 行）时这一步尤其明显。
+    func prepareForNewDocument() {
+        guard let textView = clientView as? MarkdownTextView else { return }
+        metrics = TextMetrics(lineCount: 0, version: -1)   // 强制重算，不信任旧版本号
+        syncMetrics(textView)
+        needsDisplay = true
+    }
+
     // MARK: - 自检入口
 
     /// 自检用：当前可见行号（验证绘制内容非空）

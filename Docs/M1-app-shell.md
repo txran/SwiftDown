@@ -318,28 +318,40 @@ PRD §FR-07 只要求主题与字体，这里的设置面板属于**用户追加
 
 ---
 
-## 五之七、打开第二个文件时「闪一下」的实测结论（第六轮反馈，未改代码）
+## 五之七、打开第二个文件时「闪一下」的定位与修复（第七轮，已改代码）
 
 现象：应用运行中从访达双击另一个 `.md`，窗口会闪一下。
 
-实测方法：应用打开文件后，按固定间隔连续截屏（`screencapture -l <windowID>`），
-逐帧比对窗口尺寸、`kCGWindowAlpha`、帧内容。
+### 第六轮的误判
 
-结论：**这是 macOS 的应用激活过渡，不是视图重建**。依据：
+第六轮用 `screencapture -l <windowID>` 连拍比对，得出「这是应用激活过渡、前台打开不复现」的结论，并回滚了修复。
+这个结论**不成立**：`screencapture` 单帧耗时在百毫秒量级，而一帧空白在 60Hz 上只有 16.7ms，
+这个采样率根本抓不到。真正有判别力的是「视图实例是否被销毁」，不是截图。
 
-| 场景 | 连拍结果 |
-|---|---|
-| 终端执行 `open -a`（应用在后台） | 第 1 帧整窗偏灰、内容半透明，随后 9 帧稳定 —— 一帧过渡 |
-| 应用已在前台时打开新文件 | 10 帧完全一致，**没有**过渡帧 |
-| 打开新文件窗口 id / alpha | 保持同一 id，`alpha` 恒为 1.0 |
+### 第七轮的定位
 
-即：从别的应用切到 SwiftDown 时，系统会对窗口做一次显示过渡（内容先以背景材质呈现再合成）；
-应用本来就在前台时打开文件不会闪。
+直接看视图身份：`RootView` 上 `EditorView` 挂的 `.id(tab.id)` 让每次打开/切换文档都改变视图身份，
+SwiftUI 于是销毁整棵编辑区子树并重新创建——`NSScrollView` / `NSTextView` / `NSTextStorage` / 行号标尺
+全部重建，且「旧视图移除」与「新视图挂载」跨一个 CA 事务，中间那一帧就是用户看到的空白。
 
-期间还验证了一条**不能走**的修法（已回滚，见 ADR-13）：
-去掉 `RootView` 上 `EditorView` 的 `.id(tab.id)`、改成原地复用同一个 `NSTextView`。
-原地换文档后 `NSScrollView` 与 `NSRulerView` 的联动会错位（实测文本视图被撑到含行号栏的整宽，
-首行 `# 文` 被行号栏盖住），且布局期写 `@Published` 会把窗口显示动画打断（`alpha` 停在 0）。
+其他编辑器不闪，是因为它们切换文档时**从不销毁编辑器**：TextEdit 换 `attributedString`，
+VS Code 换 Monaco 的 model，Typora 同理。这是架构差异，不是绘制性能差异。
+
+### 修复
+
+- 去掉 `.id(tab.id)`；`EditorView.updateNSView` 检测 `tab` 身份变化后调用 `Coordinator.adopt(_:)`：
+  替换文本存储、重刷高亮、清空撤销栈、复位选区与滚动，行为与「每份文档一个干净视图」等价。
+- 第六轮踩的两个坑都有确定性解法（详见 ADR-13）：
+  1. 标尺宽度原本只在 `draw` 里更新，晚于文本区重排 → 新增 `prepareForNewDocument()` 主动算宽度，
+     再 `layoutSubtreeIfNeeded()`，最后把 `textView.frame` 贴到 `contentView.frame.width`；
+  2. adopt 跑在 SwiftUI 布局期，期间用 `isAdopting` 屏蔽 `boundsDidChange` 与
+     `textViewDidChangeSelection` 回写 `focusedLine`，状态重置推到下一轮 runloop。
+
+### 回归方式
+
+自检断言**实例同一性**（切换前后 `NSTextView` 必须 `===`），并覆盖第六轮的两个翻车点：
+标尺确实随位数变宽（46 → 50）、文本区宽度 == `clipView` 宽度、切换后行号仍连续。
+把 `.id(tab.id)` 加回去，这组断言会立即 FAIL——断言有效性已验证过。
 
 ## 六、已知限制（不影响 M1 出口，M2 处理）
 

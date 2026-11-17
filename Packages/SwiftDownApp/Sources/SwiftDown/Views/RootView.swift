@@ -71,11 +71,17 @@ struct RootView: View {
                 DocumentBanner(tab: tab)
                 HStack(spacing: 0) {
                     if workspace.viewMode != .preview {
+                        // 注意：这里**不能**加 `.id(tab.id)`。
+                        // 加了会让每次打开/切换文档都销毁重建整棵编辑区子树
+                        // （NSScrollView / NSTextView / 行号标尺全新建，且要跨一个
+                        // CA 事务先拆后装），中间会漏出一帧未挂载的空白 —— 就是
+                        // 用户看到的「开新文件闪一下」。切换文档的内容替换由
+                        // EditorView.updateNSView 里的 tabChanged 分支负责，
+                        // 与 TextEdit / VS Code 的做法一致：编辑器实例存活，只换内容。
                         EditorView(tab: tab,
                                    fontSize: settings.fontSize,
                                    fontFamily: settings.fontFamily,
                                    showLineNumbers: settings.showLineNumbers)
-                            .id(tab.id)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
                     if workspace.viewMode == .split {

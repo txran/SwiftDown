@@ -230,16 +230,70 @@ enum SelfTest {
         check("FR-06 采用磁盘版后正文取磁盘内容", tab.text.contains("external-change-2"))
 
         // 6.5 多标签切换（FR-05）
+        //   第二篇故意做成 1200 行：行号栏位数会从 2 位涨到 4 位，
+        //   用来验证「换文档后标尺变宽、文本区必须跟着收窄」这条曾经的翻车点。
         let secondFile = tempDirectory.appendingPathComponent("second.md")
-        try? "# 第二篇\n\n内容\n".write(to: secondFile, atomically: true, encoding: .utf8)
-        workspace.open(url: secondFile)
-        try? await Task.sleep(nanoseconds: 600_000_000)
-        check("FR-05 打开第二个文件", workspace.tabs.count == 2, "tabs=\(workspace.tabs.count)")
+        let secondBody = (1...1200).map { "第 \($0) 行" }.joined(separator: "\n") + "\n"
+        try? "# 第二篇\n\n\(secondBody)".write(to: secondFile, atomically: true, encoding: .utf8)
+
+        // 先把编辑器停在短文档上，作为「复用」的基准（标尺此时是窄版）
         let start = Date()
         workspace.activate(tab)
         let switchMS = Date().timeIntervalSince(start) * 1000
         check("FR-05 标签切换生效", workspace.activeTab?.id == tab.id)
         check("FR-05 标签切换耗时 ≤50ms", switchMS < 50, String(format: "%.2fms", switchMS))
+        try? await Task.sleep(nanoseconds: 300_000_000)
+
+        // 6.5.1 切标签必须复用同一个编辑器实例。
+        //   曾经在 RootView 上写 `.id(tab.id)` 强制重建整棵编辑区，
+        //   AppKit 视图「旧的已拆、新的未挂」之间会漏出一帧空白，
+        //   用户侧表现就是「运行中打开另一个 md 会闪一下」。
+        //   这里断言的是**实例同一性**——渲染类问题不能用「看着不闪」来验证。
+        host.layoutSubtreeIfNeeded()
+        let editorBefore = collectTextViews(in: host).first
+        // 必须取**数值快照**：复用后 ruler 是同一个对象，
+        // 断言执行时再读 ruleThickness 拿到的会是切换之后的值
+        let thicknessBefore = collectRulers(in: host)
+            .compactMap { $0 as? LineNumberRulerView }.first?.ruleThickness ?? 0
+        workspace.open(url: secondFile)
+        try? await Task.sleep(nanoseconds: 600_000_000)
+        host.layoutSubtreeIfNeeded()
+        let editorAfter = collectTextViews(in: host).first
+        let rulerAfter = collectRulers(in: host).compactMap { $0 as? LineNumberRulerView }.first
+        check("FR-05 切换文档复用同一编辑器实例",
+              editorBefore != nil && editorAfter === editorBefore,
+              editorBefore == nil ? "切换前无编辑器" : (editorAfter === editorBefore ? "同一实例" : "实例被重建"))
+        check("FR-05 切换后编辑器内容为新文档",
+              editorAfter?.string == workspace.activeTab?.text,
+              "editor=\(editorAfter?.string.utf8.count ?? -1)B doc=\(workspace.activeTab?.text.utf8.count ?? -1)B")
+        check("FR-05 切换后撤销栈已按文档隔离",
+              editorAfter?.undoManager?.canUndo != true)
+
+        // 复用最容易翻车的地方：标尺宽度变了，文本视图没跟着收窄，首行被行号盖住
+        if let editor = editorAfter,
+           let clip = editor.enclosingScrollView?.contentView,
+           let rulerAfter {
+            check("FR-05 行号栏宽度随行数位数变化",
+                  thicknessBefore < rulerAfter.ruleThickness,
+                  String(format: "%.0f → %.0f（基准文档 %d 行）",
+                         thicknessBefore, rulerAfter.ruleThickness,
+                         tab.text.components(separatedBy: "\n").count))
+            check("FR-05 切换后文本区不吃行号栏宽度（首行不被遮）",
+                  abs(editor.frame.width - clip.frame.width) <= 1,
+                  String(format: "text=%.1f clip=%.1f", editor.frame.width, clip.frame.width))
+            if let md = editor as? MarkdownTextView {
+                let numbers = rulerAfter.debugVisibleLineNumbers()
+                check("FR-05 切换后行号仍连续（非全 1）",
+                      numbers.first == 1 && numbers.count > 1 && numbers == Array(1...max(1, numbers.count)),
+                      "count=\(numbers.count) lines=\(md.logicalLineCount)")
+            }
+        }
+
+        check("FR-05 打开第二个文件", workspace.tabs.count == 2, "tabs=\(workspace.tabs.count)")
+        // 切回来同样不能重建（否则「点标签」也会闪）
+        host.layoutSubtreeIfNeeded()
+        check("FR-05 切回标签仍复用同一编辑器实例",
+              collectTextViews(in: host).first === editorBefore)
 
         // 6.6 会话恢复（FR-05）
         workspace.persistNow()

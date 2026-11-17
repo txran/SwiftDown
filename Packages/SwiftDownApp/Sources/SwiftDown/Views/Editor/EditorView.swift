@@ -75,6 +75,7 @@ struct EditorView: NSViewRepresentable {
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         let coordinator = context.coordinator
+        let tabChanged = coordinator.tab !== tab
         coordinator.parent = self
         coordinator.tab = tab
         guard let textView = coordinator.textView else { return }
@@ -92,6 +93,12 @@ struct EditorView: NSViewRepresentable {
             if let storage = textView.textStorage {
                 MarkdownHighlighter.apply(to: storage, theme: desired)
             }
+        }
+
+        // 切文档：复用同一个编辑器实例，只把内容换掉（见 adopt）。
+        // 放在主题同步之后，保证新文档第一次绘制就用的是当前字号/字体。
+        if tabChanged {
+            coordinator.adopt(tab)
         }
 
         // 行号开关
@@ -144,6 +151,10 @@ struct EditorView: NSViewRepresentable {
         var theme: EditorTheme
         var fontName: String
         private var highlightWork: DispatchWorkItem?
+        /// 换文档期间置位：此时任何「读光标/滚动位置 → 写 tab.focusedLine」都会
+        /// 变成在 SwiftUI 布局期修改 @Published，把布局打回循环
+        /// （上一轮就是这样让窗口显示动画中断、alpha 卡在 0 的）。
+        private var isAdopting = false
         private var scrollObserver: NSObjectProtocol?
         private var lastReportedLine = 1
         // 滚动期行号上报节流：连续滚动时每次都写 @Published 会触发整棵
@@ -170,6 +181,67 @@ struct EditorView: NSViewRepresentable {
             }
         }
 
+        /// 切换到另一个文档标签（打开新文件 / 点标签 / 快捷键轮转）。
+        ///
+        /// 关键：**不重建视图**。外层 `RootView` 曾经用 `.id(tab.id)` 强制重建整棵
+        /// 编辑区，AppKit 视图会在「旧的已拆、新的未挂」之间漏出一帧空白，
+        /// 表现为打开文件时闪一下（切标签同理，只是幅度大小不同）。
+        /// 这里改成与 TextEdit / VS Code 一致的做法：编辑器实例存活，
+        /// 只替换 textStorage 内容，并把瞬态状态（撤销栈、选区、滚动）重置。
+        func adopt(_ newTab: DocumentTab) {
+            tab = newTab
+            revision = newTab.revision
+            // 跨文档的跳转令牌没有可比性，不同步会让新文档被误判成「要跳转」
+            lastJumpToken = newTab.jumpToken
+
+            guard let textView else { return }
+
+            // 换内容 + 复位滚动期间屏蔽「位置 → 状态」的回写：
+            // 这一帧正处在 SwiftUI 布局期，同步写 @Published 会把布局打回循环。
+            isAdopting = true
+
+            textView.replaceEntireText(with: newTab.text, theme: theme)
+            if let storage = textView.textStorage {
+                MarkdownHighlighter.apply(to: storage, theme: theme)
+            }
+            // 先让行号栏按新文档的行数（位数）算好宽度，再重排文本区宽度，
+            // 避免「标尺变宽」和「文本重排」错开一帧造成横向跳动
+            ruler?.prepareForNewDocument()
+
+            // 撤销栈必须按文档隔离。旧实现靠视图重建天然清空，
+            // 复用后若不显式清，在新文档里按 ⌘Z 会撤销出上一个文档的内容。
+            textView.undoManager?.removeAllActions()
+
+            textView.setSelectedRange(NSRange(location: 0, length: 0))
+
+            if let scrollView {
+                scrollView.contentView.scroll(to: .zero)
+                scrollView.reflectScrolledClipView(scrollView.contentView)
+                // 行号栏宽度随行数（位数）变化，换文档后必须让文本视图重新贴合
+                // 可视宽度；否则它保持旧宽度，会被变宽的标尺压住首行字符
+                // （上一轮就是这样翻车的：肉眼看到「# 文」被行号盖掉）。
+                scrollView.layoutSubtreeIfNeeded()
+                let clipWidth = scrollView.contentView.frame.width
+                if clipWidth > 0, abs(textView.frame.width - clipWidth) > 0.5 {
+                    textView.setFrameSize(NSSize(
+                        width: clipWidth,
+                        height: max(textView.frame.height, scrollView.contentView.frame.height)))
+                }
+            }
+
+            textView.needsDisplay = true
+            ruler?.needsDisplay = true
+
+            lastReportedLine = 1
+            isAdopting = false
+
+            // 行号状态推到下一轮 runloop 再对齐：布局期写 @Published 会把布局打回循环
+            DispatchQueue.main.async { [weak self, weak newTab] in
+                guard let self, let newTab, self.tab === newTab else { return }
+                if newTab.focusedLine != 1 { newTab.focusedLine = 1 }
+            }
+        }
+
         func observeScroll() {
             guard let scrollView else { return }
             // 通知本身就派发在主线程（queue: .main），这里直接同步处理。
@@ -181,7 +253,7 @@ struct EditorView: NSViewRepresentable {
                 queue: .main
             ) { [weak self] _ in
                 MainActor.assumeIsolated {
-                    guard let self, let textView = self.textView else { return }
+                    guard let self, let textView = self.textView, !self.isAdopting else { return }
                     let line = textView.topVisibleLine
                     if line != self.lastReportedLine {
                         self.lastReportedLine = line
@@ -237,7 +309,8 @@ struct EditorView: NSViewRepresentable {
         // MARK: NSTextViewDelegate
 
         func textViewDidChangeSelection(_ notification: Notification) {
-            guard let textView else { return }
+            // 换文档时会主动重设选区，那次回调不是用户行为，不能回写 focusedLine
+            guard let textView, !isAdopting else { return }
             textView.typingAttributes = theme.baseAttributes
             let line = textView.currentLine
             if line != lastReportedLine {
