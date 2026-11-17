@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024"
+     viewBox="0 0 1024 1024">
+<defs>
+  <linearGradient id="bg" x1="0.14" y1="0" x2="0.86" y2="1">
+    <stop offset="0" stop-color="#26365F"/><stop offset="0.5" stop-color="#16203A"/>
+    <stop offset="1" stop-color="#080D1A"/>
+  </linearGradient>
+  <radialGradient id="glow" cx="0.34" cy="0.06" r="0.85">
+    <stop offset="0" stop-color="#9CBBFF" stop-opacity="0.16"/>
+    <stop offset="0.55" stop-color="#93B4FF" stop-opacity="0.035"/>
+    <stop offset="1" stop-color="#93B4FF" stop-opacity="0"/>
+  </radialGradient>
+  <linearGradient id="paper" x1="0.12" y1="0" x2="0.8" y2="1">
+    <stop offset="0" stop-color="#FFFFFF"/><stop offset="0.55" stop-color="#FCFAF5"/>
+    <stop offset="1" stop-color="#EFEBE0"/>
+  </linearGradient>
+  <linearGradient id="seal" gradientUnits="userSpaceOnUse"
+                  x1="272.0" y1="385" x2="552.0" y2="625">
+    <stop offset="0" stop-color="#FF6F49"/><stop offset="1" stop-color="#E2401D"/>
+  </linearGradient>
+  <filter id="pageShadow" x="-60%" y="-60%" width="220%" height="240%"><feDropShadow dx="0" dy="16" stdDeviation="16" flood-color="#02050C" flood-opacity="0.55"/></filter>
+  <filter id="arrowShadow" x="-60%" y="-60%" width="220%" height="240%">
+    <feDropShadow dx="0" dy="6" stdDeviation="7" flood-color="#8C2A0C" flood-opacity="0.35"/>
+  </filter>
+</defs>
+
+<!-- 全出血底色：铺满画布，圆角由系统遮罩完成 -->
+<rect width="1024" height="1024" fill="url(#bg)"/>
+<rect width="1024" height="1024" fill="url(#glow)"/>
+
+<!-- 内容层：在 0..824 设计空间里排版，整体放大铺满画布（纯缩放，不能再平移） -->
+<g transform="scale(1.242718)">
+  <g filter="url(#pageShadow)">
+    <rect x="177.0" y="123" width="470" height="578" rx="64" fill="url(#paper)"/>
+  </g>
+
+    <rect x="241.0" y="223" width="302" height="36" rx="18.0" fill="#2C3552" opacity="1.0"/>
+    <rect x="241.0" y="293" width="198" height="36" rx="18.0" fill="#2C3552" opacity="0.5"/>
+
+  <g filter="url(#arrowShadow)">
+    <path d="M412.0 385 L412.0 582.8" stroke="url(#seal)" stroke-width="62" stroke-linecap="round" fill="none"/>
+    <path d="M272.0 501 L412.0 625 L552.0 501" stroke="url(#seal)" stroke-width="62" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  </g>
+</g>
+</svg>
