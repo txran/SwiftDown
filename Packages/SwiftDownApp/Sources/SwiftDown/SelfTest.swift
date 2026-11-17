@@ -255,7 +255,8 @@ enum SelfTest {
         // 6.7 会话恢复必须丢掉临时路径：自检残留的 …/selftest.md 曾出现在用户真实标签里，
         //     文件被删后走「外部变更 → 冲突 → 保存失败」，是上一轮卡死的入口。
         let tempSample = NSTemporaryDirectory() + "swiftdown-selftest-demo/selftest.md"
-        let realSample = "/Users/txran/Documents/note.md"
+        // 占位路径：只用于「非临时目录」的判断，不要写成真实用户目录（会泄露本机用户名）
+        let realSample = "/Users/example/Documents/note.md"
         check("FR-05 恢复会话过滤临时路径",
               Workspace.filterRestorablePaths([tempSample, realSample], dropTemporary: true) == [realSample],
               "过滤后=\(Workspace.filterRestorablePaths([tempSample, realSample], dropTemporary: true))")
