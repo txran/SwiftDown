@@ -35,6 +35,19 @@
   <img src="Docs/screenshot-tabbar-wrap.png" width="380" alt="多行标签栏">
 </p>
 
+## 下载安装
+
+不想自己编译就直接下发行版：[**Releases**](https://gitee.com/txran/swift-down/releases)
+
+| 文件 | 用法 |
+|---|---|
+| `SwiftDown-0.1.0-arm64.dmg` | 打开后把 SwiftDown 拖进「应用程序」 |
+| `SwiftDown-0.1.0-arm64.zip` | 解压即用，适合脚本化下载 |
+
+- **仅 Apple Silicon（arm64）**，macOS 13+；Intel 机器请按下面的方式自行编译。
+- 发行包是 ad-hoc 签名（无开发者证书）。首次打开被拦时：访达里右键 → 打开；
+  或执行 `xattr -dr com.apple.quarantine /Applications/SwiftDown.app`。
+
 ## 系统要求
 
 - macOS 13 Ventura 及以上
@@ -55,6 +68,12 @@ open build/SwiftDown.app
 ```
 
 调试构建：`./Scripts/build-app.sh debug`
+
+要发给别人用的发行包（产出 `.dmg` 与 `.zip` 到 `build/dist/`）：
+
+```bash
+./Scripts/package-app.sh
+```
 
 打开单个文件也可以直接：
 
