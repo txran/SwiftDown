@@ -167,6 +167,7 @@ final class Workspace: ObservableObject {
 
     func open(url: URL) {
         let target = url.standardizedFileURL
+        OpenTrace.shared.begin("open \(target.lastPathComponent)（触发前 active=\(NSApp.isActive ? 1 : 0)）")
 
         // FR-01：重复打开同一文件 → 聚焦已有标签，不新建
         if let existing = tabs.first(where: { $0.url.standardizedFileURL == target }) {
@@ -178,13 +179,18 @@ final class Workspace: ObservableObject {
         }
 
         let size = DiskFileStore.fileSize(at: target)
+        OpenTrace.mark("open 开始 \(target.lastPathComponent) \(size / 1024)KB")
         do {
             let session = try DocumentSession(url: target, store: store)
+            OpenTrace.mark("DocumentSession 建立（已读盘）")
             let tab = DocumentTab(session: session,
                                   settings: settings,
                                   isReadOnly: size > Self.readOnlyThreshold)
+            OpenTrace.mark("DocumentTab 构造完成")
             attach(tab)
+            OpenTrace.mark("attach 完成")
             settings.noteOpened(target)
+            OpenTrace.mark("noteOpened 完成")
         } catch {
             alertMessage = AlertMessage(
                 title: "无法打开文件",

@@ -41,17 +41,17 @@
 
 不想自己编译就直接下发行版：[**Releases**](https://gitee.com/txran/swift-down/releases)
 
-当前版本 **0.1.1**：[发行说明](https://gitee.com/txran/swift-down/releases/tag/v0.1.1)
+当前版本 **0.1.2**：[发行说明](https://gitee.com/txran/swift-down/releases/tag/v0.1.2)
 
 | 文件 | 用法 |
 |---|---|
-| [`SwiftDown-0.1.1-arm64.dmg`](https://gitee.com/txran/swift-down/releases/download/v0.1.1/SwiftDown-0.1.1-arm64.dmg) | 打开后把 SwiftDown 拖进「应用程序」 |
-| [`SwiftDown-0.1.1-arm64.zip`](https://gitee.com/txran/swift-down/releases/download/v0.1.1/SwiftDown-0.1.1-arm64.zip) | 解压即用，适合脚本化下载 |
+| [`SwiftDown-0.1.2-arm64.dmg`](https://gitee.com/txran/swift-down/releases/download/v0.1.2/SwiftDown-0.1.2-arm64.dmg) | 打开后把 SwiftDown 拖进「应用程序」 |
+| [`SwiftDown-0.1.2-arm64.zip`](https://gitee.com/txran/swift-down/releases/download/v0.1.2/SwiftDown-0.1.2-arm64.zip) | 解压即用，适合脚本化下载 |
 
 ```bash
 # 命令行安装（不想拖拽时）
 curl -L -o /tmp/SwiftDown.zip \
-  https://gitee.com/txran/swift-down/releases/download/v0.1.1/SwiftDown-0.1.1-arm64.zip
+  https://gitee.com/txran/swift-down/releases/download/v0.1.2/SwiftDown-0.1.2-arm64.zip
 ditto -x -k /tmp/SwiftDown.zip /Applications
 xattr -dr com.apple.quarantine /Applications/SwiftDown.app
 ```

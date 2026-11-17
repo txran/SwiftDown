@@ -54,6 +54,34 @@ struct EditorTheme {
 /// tree-sitter 留到 M2 做代码块内嵌高亮时再评估（设计文档 §6.4）。
 enum MarkdownHighlighter {
 
+    /// 超过这个字符数就不再全文高亮。
+    ///
+    /// 实测：4.8MB / 330 万字符的文档全文高亮一次 **2.5 秒**，这 2.5 秒主线程完全阻塞、
+    /// 一帧都不出，用户看到的就是「窗口像卡死又被重新打开」。小文档（<20 万字符）
+    /// 全文扫描仍在 10ms 量级，保持全文以获得一致的高亮结果。
+    static let fullScanThreshold = 200_000
+
+    /// 可见区补刷时上下各多刷的字符数（滚动时不会看到边缘「掉色」）
+    static let visiblePadding = 8_192
+
+    /// 首次装载 / 换文档时用：大文档只刷当前可见区，其余交给滚动补刷。
+    static func applyInitial(to storage: NSTextStorage, in textView: NSTextView, theme: EditorTheme) {
+        guard storage.length > fullScanThreshold else {
+            apply(to: storage, theme: theme)
+            return
+        }
+        apply(to: storage, theme: theme, limitTo: visibleRange(in: textView))
+    }
+
+    /// 当前可见区对应的待高亮范围（已含上下 padding）
+    static func visibleRange(in textView: NSTextView) -> NSRange {
+        let visible = textView.visibleRect
+        let anchor = textView.characterIndexForInsertion(at: NSPoint(x: 0, y: max(0, visible.minY)))
+        let length = (textView.string as NSString).length
+        let start = max(0, min(anchor, length) - visiblePadding)
+        return NSRange(location: start, length: min(length - start, visiblePadding * 2 + 4096))
+    }
+
     static func apply(to storage: NSTextStorage, theme: EditorTheme, limitTo limit: NSRange? = nil) {
         let text = storage.string as NSString
         let full = NSRange(location: 0, length: text.length)
@@ -73,6 +101,7 @@ enum MarkdownHighlighter {
         storage.setAttributes(theme.baseAttributes, range: target)
         let style = theme.paragraphStyle
         storage.addAttribute(.paragraphStyle, value: style, range: target)
+        OpenTrace.mark("    paragraphStyle")
 
         var inFence = false
         var fenceMarker = ""
@@ -98,7 +127,13 @@ enum MarkdownHighlighter {
 
     private static func fenceStateBefore(text: NSString, offset: Int, marker: inout String) -> Bool {
         var inFence = false
-        var cursor = 0
+        // 只回溯最近 256KB：从文档头扫到目标位置等于 O(全文)，
+        // 大文档滚到末尾时这一步单独就要一秒。围栏跨过 256KB 的情况实际不存在。
+        let window = 262_144
+        var cursor = offset > window ? offset - window : 0
+        if cursor > 0 {
+            cursor = text.lineRange(for: NSRange(location: cursor, length: 0)).location
+        }
         while cursor < offset {
             let lineRange = text.lineRange(for: NSRange(location: cursor, length: 0))
             let line = text.substring(with: lineRange)

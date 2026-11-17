@@ -216,6 +216,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 NSApp.terminate(nil)
             }
         }
+
+        // 帧级探针（仅排查用）：--start A.md --trace-open B.md
+        // 等价于「先打开 A，再在运行中打开 B」，用于定位「闪一下」发生在哪一层。
+        if let start = value(after: "--start"), let target = value(after: "--trace-open") {
+            env.workspace.open(url: URL(fileURLWithPath: start))
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                env.workspace.open(url: URL(fileURLWithPath: target))
+            }
+        }
+    }
+
+    private func value(after flag: String) -> String? {
+        let args = CommandLine.arguments
+        guard let index = args.firstIndex(of: flag), args.count > index + 1 else { return nil }
+        return args[index + 1]
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {

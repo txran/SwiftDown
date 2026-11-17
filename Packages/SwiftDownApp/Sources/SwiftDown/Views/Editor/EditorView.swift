@@ -69,7 +69,17 @@ struct EditorView: NSViewRepresentable {
         coordinator.revision = tab.revision
         coordinator.observeScroll()
 
-        MarkdownHighlighter.apply(to: storage ?? NSTextStorage(), theme: theme)
+        if let storage {
+            if storage.length <= MarkdownHighlighter.fullScanThreshold {
+                MarkdownHighlighter.applyInitial(to: storage, in: textView, theme: theme)
+                coordinator.lastHighlightedVisible = MarkdownHighlighter.visibleRange(in: textView)
+            } else {
+                // 大文档：先让正文上屏，高亮推到下一轮 runloop（首次写属性有一次性索引开销）
+                DispatchQueue.main.async { [weak coordinator] in
+                    coordinator?.applyVisibleRefresh()
+                }
+            }
+        }
         return scrollView
     }
 
@@ -164,6 +174,10 @@ struct EditorView: NSViewRepresentable {
         private var lastLineReportedAt: CFTimeInterval = 0
         private static let lineReportInterval: CFTimeInterval = 0.08
 
+        /// 上次高亮过的可见区（大文档只刷可见区时用来避免重复刷）
+        var lastHighlightedVisible: NSRange?
+        private var visibleRefreshWork: DispatchWorkItem?
+
         init(tab: DocumentTab) {
             self.tab = tab
             self.parent = EditorView(tab: tab, fontSize: 13.5, fontFamily: .sfMono, showLineNumbers: true)
@@ -176,9 +190,38 @@ struct EditorView: NSViewRepresentable {
         func teardown() {
             highlightWork?.cancel()
             pendingLineWork?.cancel()
+            visibleRefreshWork?.cancel()
             if let scrollObserver {
                 NotificationCenter.default.removeObserver(scrollObserver)
             }
+        }
+
+        // MARK: 大文档的可见区高亮补刷
+        //
+        // 首次装载/换文档时大文档只刷了首屏（全文扫描实测 2.5s，会把主线程按死），
+        // 滚到下面如果不补，用户看到的是一堆没有语法色的纯文本。
+
+        private func scheduleVisibleRefreshIfNeeded() {
+            guard let textView, let storage = textView.textStorage,
+                  storage.length > MarkdownHighlighter.fullScanThreshold else { return }
+            let range = MarkdownHighlighter.visibleRange(in: textView)
+            if let last = lastHighlightedVisible,
+               abs(last.location - range.location) < MarkdownHighlighter.visiblePadding / 2 { return }
+            visibleRefreshWork?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                MainActor.assumeIsolated { self?.applyVisibleRefresh() }
+            }
+            visibleRefreshWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
+        }
+
+        func applyVisibleRefresh() {
+            guard let textView, let storage = textView.textStorage, !isAdopting,
+                  storage.length > MarkdownHighlighter.fullScanThreshold else { return }
+            let range = MarkdownHighlighter.visibleRange(in: textView)
+            lastHighlightedVisible = range
+            MarkdownHighlighter.apply(to: storage, theme: theme, limitTo: range)
+            textView.needsDisplay = true
         }
 
         /// 切换到另一个文档标签（打开新文件 / 点标签 / 快捷键轮转）。
@@ -200,13 +243,10 @@ struct EditorView: NSViewRepresentable {
             // 这一帧正处在 SwiftUI 布局期，同步写 @Published 会把布局打回循环。
             isAdopting = true
 
+            OpenTrace.mark("adopt 开始 chars=\((newTab.text as NSString).length)")
+
             textView.replaceEntireText(with: newTab.text, theme: theme)
-            if let storage = textView.textStorage {
-                MarkdownHighlighter.apply(to: storage, theme: theme)
-            }
-            // 先让行号栏按新文档的行数（位数）算好宽度，再重排文本区宽度，
-            // 避免「标尺变宽」和「文本重排」错开一帧造成横向跳动
-            ruler?.prepareForNewDocument()
+            OpenTrace.mark("replaceEntireText 完成")
 
             // 撤销栈必须按文档隔离。旧实现靠视图重建天然清空，
             // 复用后若不显式清，在新文档里按 ⌘Z 会撤销出上一个文档的内容。
@@ -214,18 +254,43 @@ struct EditorView: NSViewRepresentable {
 
             textView.setSelectedRange(NSRange(location: 0, length: 0))
 
+            // 顺序很关键：**先**让行号栏按新文档的行数（位数）算好宽度，
+            // **再**布局，clipView 才会扣掉新的标尺宽度，最后文本视图才能贴准。
+            // 反过来（先布局再改标尺）会拿到按旧标尺算的宽度，
+            // 标尺随后变宽就把首行压住 —— 自检里有一条断言专盯这个。
+            ruler?.prepareForNewDocument()
+            OpenTrace.mark("prepareForNewDocument 完成")
+
             if let scrollView {
                 scrollView.contentView.scroll(to: .zero)
                 scrollView.reflectScrolledClipView(scrollView.contentView)
-                // 行号栏宽度随行数（位数）变化，换文档后必须让文本视图重新贴合
-                // 可视宽度；否则它保持旧宽度，会被变宽的标尺压住首行字符
-                // （上一轮就是这样翻车的：肉眼看到「# 文」被行号盖掉）。
                 scrollView.layoutSubtreeIfNeeded()
+                OpenTrace.mark("layoutSubtreeIfNeeded 完成")
                 let clipWidth = scrollView.contentView.frame.width
                 if clipWidth > 0, abs(textView.frame.width - clipWidth) > 0.5 {
                     textView.setFrameSize(NSSize(
                         width: clipWidth,
                         height: max(textView.frame.height, scrollView.contentView.frame.height)))
+                }
+            }
+
+            // 高亮放在滚动复位之后：大文档只刷首屏可见区，这里拿到的才是最终可视位置。
+            //
+            // 大文档的关键取舍：TextKit 2 对超长文本**首次**写布局属性有一次性索引开销
+            // （实测 330 万字符约 220ms，同范围第二次只需 0.04ms），同步做会把「打开文件」
+            // 拖到几百毫秒、用户看到的是空白窗口。这里让正文先上屏（约 17ms），
+            // 高亮推到下一轮 runloop —— 用户看到的顺序变成「内容立刻出现 → 语法色紧跟着上」。
+            if let storage = textView.textStorage {
+                if storage.length <= MarkdownHighlighter.fullScanThreshold {
+                    MarkdownHighlighter.applyInitial(to: storage, in: textView, theme: theme)
+                    lastHighlightedVisible = MarkdownHighlighter.visibleRange(in: textView)
+                    OpenTrace.mark("MarkdownHighlighter 同步完成")
+                } else {
+                    lastHighlightedVisible = nil
+                    DispatchQueue.main.async { [weak self] in
+                        self?.applyVisibleRefresh()
+                    }
+                    OpenTrace.mark("MarkdownHighlighter 已推迟（大文档）")
                 }
             }
 
@@ -260,6 +325,7 @@ struct EditorView: NSViewRepresentable {
                         self.reportLineThrottled(line)
                     }
                     self.ruler?.needsDisplay = true
+                    self.scheduleVisibleRefreshIfNeeded()
                 }
             }
         }
@@ -334,15 +400,15 @@ struct EditorView: NSViewRepresentable {
 
         private func applyHighlight() {
             guard let textView, let storage = textView.textStorage else { return }
-            // 小文档全量刷，大文档只刷可见区域（±4KB），保证按键不进 GC 抖动
-            if storage.length <= 300_000 {
+            // 小文档全文刷，大文档只刷可见区：全文扫描 330 万字符实测 2.5s，
+            // 每敲一个字都付这个代价是不可接受的。
+            if storage.length <= MarkdownHighlighter.fullScanThreshold {
                 MarkdownHighlighter.apply(to: storage, theme: theme)
+                lastHighlightedVisible = nil
             } else {
-                let visible = textView.visibleRect
-                let glyphRangeStart = textView.characterIndexForInsertion(at: NSPoint(x: 0, y: visible.minY))
-                MarkdownHighlighter.apply(to: storage,
-                                          theme: theme,
-                                          limitTo: NSRange(location: max(0, glyphRangeStart), length: 4096))
+                let range = MarkdownHighlighter.visibleRange(in: textView)
+                lastHighlightedVisible = range
+                MarkdownHighlighter.apply(to: storage, theme: theme, limitTo: range)
             }
             textView.needsDisplay = true
             ruler?.needsDisplay = true
