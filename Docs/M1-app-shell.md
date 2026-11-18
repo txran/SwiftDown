@@ -592,3 +592,54 @@ app.sendEvent(leftMouseDown)   → hitTest 次数=1, currentEvent=nil
 「启动阶段只读元信息、不读文档」。
 
 **教训**：跑在主线程上的探针观测不到主线程卡死；要测「卡住」，心跳通道必须活在另一个线程上。
+
+---
+
+## 第十三轮：应用图标又变两个（0.1.5 之后）
+
+现象：`/Applications` 里明明只有一份 SwiftDown.app，系统里却还是显示两个。
+
+### 归因链
+
+```
+lsregister -dump | grep SwiftDown   → 732 条命中
+  ├─ 37 条唯一路径
+  │    ├─ /Applications/SwiftDown.app             ← 正式版，v0.1.5
+  │    ├─ build/.dev/SwiftDown.app                ← 开发版，id dev.swiftdown.app.dev（安全）
+  │    ├─ /private/tmp/sd{2,3,4,5,6,7}.app 等 11 个 ← id 全是 dev.swiftdown.app，v0.1.2~0.1.4
+  │    └─ ~/.Trash/ 下 33 份历史构建副本
+  └─ 其余为同一条目的多个记录
+```
+
+真凶是 `/private/tmp` 下那 11 个副本：**bundle id 与正式版完全相同**。这是前几轮做图标验证、
+「全新安装首次启动」验证时复制出来的临时 app，用完没有清理。LaunchServices 按
+`CFBundleIdentifier` 认身份，看到磁盘上有第二份同 id 的 .app 就当成「同一个应用的另一个拷贝」，
+启动台/聚焦里便呈现多个同名图标——和 `/Applications` 里有几个文件无关。
+
+废纸篓里的 33 份是历史遗留，但 `mdfind` 证实它们不进入 Spotlight 结果集，不影响显示；
+`lsregister -u` 注销后还会被 mds 重新加回，不必纠缠。
+
+### 处理
+
+1. 注销并删除 `/private/tmp` 下 11 个临时 app（`lsregister -u` → `rm -rf`）。
+2. 注销废纸篓中的失效注册（**不动废纸篓文件**）。
+3. `lsregister -f /Applications/SwiftDown.app` 重注册正式版，`killall Dock` 刷新缓存。
+4. 新增 `Scripts/doctor-app.sh`：
+
+```bash
+./Scripts/doctor-app.sh          # 体检：列出所有游离副本与身份冲突
+./Scripts/doctor-app.sh --fix    # 修复：注销游离注册，删除 /private/tmp 下的临时副本，重注册 + 刷新 Dock
+```
+
+脚本只删 `/private/tmp`、`/tmp` 下的测试产物，废纸篓等用户目录只注销注册、不删文件。
+
+### 复查
+
+| 检查 | 结果 |
+|---|---|
+| `lsregister` 中存活的非白名单副本 | 0 |
+| `mdfind "SwiftDown.app"` | 仅 `/Applications/SwiftDown.app` |
+| `/Applications` 内容 | 仅 `SwiftDown.app`（0.1.5） |
+
+**教训**：验证用的临时 app 必须换 bundle id，或者用完立刻删。只要同 id 的第二份文件在磁盘上
+（哪怕在 `/tmp`），系统就会认为应用有两份。以后涉及身份/图标的验证，跑完 `doctor-app.sh` 收尾。
