@@ -72,6 +72,25 @@ enum SelfTest {
         workspace.open(url: testFile)
         check("FR-01 重复打开聚焦不新建", workspace.tabs.count == before, "tabs=\(workspace.tabs.count)")
 
+        // 6.0 读盘必须离开主线程——这是「冷启动被拖到几十秒」的根治点。
+        //     判据：`open` 返回时标签还没挂上，说明读盘没有同步跑在主线程。
+        //     有人改回同步读盘时这条会立刻 FAIL，而那种改动只有在系统刚好卡住文件打开时
+        //     才会暴露（一次 5 秒起），平时完全看不出来。
+        let asyncFile = tempDirectory.appendingPathComponent("async-open.md")
+        try? "# 异步打开\n\n正文。\n".write(to: asyncFile, atomically: true, encoding: .utf8)
+        let asyncWorkspace = Workspace(
+            settings: settings,
+            restoreSessionOnInit: false,
+            sessionStore: SessionStore(directory: tempDirectory.appendingPathComponent("async-session"))
+        )
+        asyncWorkspace.open(url: asyncFile)
+        check("FR-01 打开文档的读盘不在主线程同步完成",
+              asyncWorkspace.tabs.isEmpty,
+              "open 返回后 tabs=\(asyncWorkspace.tabs.count)（同步读盘会立刻变成 1）")
+        await asyncWorkspace.openAndWait(url: asyncFile)
+        check("FR-01 异步读盘完成后标签已挂上", asyncWorkspace.tabs.count == 1,
+              "tabs=\(asyncWorkspace.tabs.count)")
+
         // 2. 视图树真实构建（三态全部走一遍）
         for mode in ViewMode.allCases {
             workspace.setViewMode(mode)
@@ -310,8 +329,18 @@ enum SelfTest {
               collectTextViews(in: host).first === editorBefore)
 
         // 6.6 会话恢复（FR-05）
+        //
+        //   恢复拆成两段：`init` 只读会话元信息（布局 + 路径清单），文档内容等首帧之后
+        //   才读。原因见 Workspace.performOpen 的注释——冷启动时一次 `open(2)` 能被系统
+        //   拖到 5 秒以上，压在启动阶段会把窗口和打开事件一起拖死。这里两段都验：
+        //   ① init 之后不应已经有标签（有就说明有人又把读盘搬回了启动路径）；
+        //   ② 恢复执行完后标签、路径、活跃项与退出前一致。
         workspace.persistNow()
         let restored = Workspace(settings: settings, restoreSessionOnInit: true)
+        check("FR-05 启动阶段只读会话元信息、不读文档",
+              restored.tabs.isEmpty,
+              "init 后 tabs=\(restored.tabs.count)（应为 0）")
+        await restored.restoreNow()
         check("FR-05 会话恢复标签数量", restored.tabs.count == workspace.tabs.count,
               "restored=\(restored.tabs.count)")
         let restoredPaths = Set(restored.tabs.map { $0.url.path })
@@ -375,7 +404,9 @@ enum SelfTest {
         try? outlineSource.write(to: outlineFile, atomically: true, encoding: .utf8)
 
         let outlineWorkspace = Workspace(settings: settings, restoreSessionOnInit: false)
-        outlineWorkspace.open(url: outlineFile)
+        // 只等「读盘 + 挂标签」：解析仍是挂上之后异步跑的，所以「先建视图、后解析完成」
+        // 这个原始时序没有被破坏。
+        await outlineWorkspace.openAndWait(url: outlineFile)
         let outlineTab = outlineWorkspace.activeTab
         let outlineHost = NSHostingView(rootView: RootView()
             .environmentObject(settings)

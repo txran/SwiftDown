@@ -72,6 +72,26 @@ public final class DocumentSession {
         self.hasUnsavedEdits = false
     }
 
+    /// 内容已经读出来的构造路径（异步读盘专用）。
+    ///
+    /// 为什么单独开门：`init(url:store:)` 会在构造过程中读盘，调用方若在主线程调用，
+    /// 就把文件系统阻塞搬到了 UI 线程上——实测冷启动时一次 `open(2)` 能被系统拖到 5 秒以上。
+    /// 把读盘交给调用方的后台队列，这里**不碰文件系统**，主线程只负责装配对象。
+    public init(url: URL,
+                content: String,
+                store: FileStoring,
+                scheduler: AutoSaveScheduling = DispatchAutoSaveScheduler(),
+                autoSaveDelay: TimeInterval = 2.0) {
+        self.id = UUID()
+        self.url = url
+        self.store = store
+        self.scheduler = scheduler
+        self.autoSaveDelay = autoSaveDelay
+        self.buffer = content
+        self.state = .clean
+        self.hasUnsavedEdits = false
+    }
+
     /// 会话恢复时文件缺失 → 占位标签（EX-06）
     public static func placeholder(url: URL, reason: String) -> DocumentSession {
         DocumentSession(url: url, buffer: "", state: .placeholder(reason: reason))

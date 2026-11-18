@@ -8,6 +8,10 @@ final class AppEnvironment: ObservableObject {
     let workspace: Workspace
 
     init() {
+        // 冷启动时间线基准：从这里开始，进程已经建好了 SwiftUI App 结构，
+        // 后续每一步都打点，日志里出现空档时就能判断空档落在哪一段。
+        LaunchProbe.mark("AppEnvironment.init 进入")
+        LaunchProbe.startWatchdog()
         // 自检跑在独立 UserDefaults 域里：真实用户的最近打开/快捷键/布局不能被测试污染
         let defaults: UserDefaults
         if CommandLine.arguments.contains("--selftest"),
@@ -25,6 +29,7 @@ final class AppEnvironment: ObservableObject {
         AppAppearance.apply(settings.themeMode)
         self.settings = settings
         self.workspace = Workspace(settings: settings)
+        LaunchProbe.mark("AppEnvironment.init 完成（会话元信息已就位）")
     }
 }
 
@@ -188,6 +193,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private weak var env: AppEnvironment?
     private var pendingURLs: [URL] = []
     private var didRunSelfTest = false
+    /// 首帧通知的订阅令牌（会话恢复在这里被触发的）
+    private var firstFrameToken: NSObjectProtocol?
 
     /// 是否已接管 kAEOpenDocuments。自检用它防回归：这段一旦被删掉，
     /// 「打开文件闪一下」会原样回来，而且没有任何其他断言能发现。
@@ -203,6 +210,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 必须装在 `applicationWillFinishLaunching`：AppKit 在启动阶段就分发 open 事件，
     /// 装晚了第一份文件还是会走 SwiftUI 那条路。
     func applicationWillFinishLaunching(_ notification: Notification) {
+        LaunchProbe.mark("willFinishLaunching 进入")
         NSAppleEventManager.shared().setEventHandler(
             self,
             andSelector: #selector(handleOpenDocuments(_:withReplyEvent:)),
@@ -210,6 +218,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             andEventID: AEEventID(kAEOpenDocuments)
         )
         AppDelegate.didTakeOverOpenDocuments = true
+        LaunchProbe.mark("willFinishLaunching 完成（已接管 open 事件）")
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        LaunchProbe.mark("didFinishLaunching")
     }
 
     @objc private func handleOpenDocuments(_ event: NSAppleEventDescriptor,
@@ -227,6 +240,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // （访达 / `open -a`）就会一直等到超时，实测表现为 -1712、双击文件后转圈。
         // 回一个空错误列表 = 全部接收成功（真失败了才在该列表里放失败项）。
         acknowledge(reply)
+        LaunchProbe.mark("open 事件：已回 reply（urls=\(urls.count)）")
 
         guard !urls.isEmpty else { return }
         TraceEvents.log("apple-event open \(urls.map(\.lastPathComponent)) isActive=\(NSApp.isActive ? 1 : 0)")
@@ -246,12 +260,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @MainActor
     func attach(_ env: AppEnvironment) {
         guard self.env == nil else { return }
+        LaunchProbe.mark("视图 onAppear → attach")
+        LaunchProbe.markFirstWindowDraw()
         TraceEvents.install()
         self.env = env
         if !pendingURLs.isEmpty {
             env.workspace.open(urls: pendingURLs)
             pendingURLs.removeAll()
         }
+        // 会话里的文档等首帧之后才读（见 restoreAfterFirstFrame）
+        restoreAfterFirstFrame(env)
         // 文档出图（非交互）：--render <md> --out <png> [--size WxH] [--mode editor|split|preview]
         //                              [--theme light|dark] [--outline 0|1] [--settings general|shortcuts]
         if let options = RenderJob.parse(CommandLine.arguments) {
@@ -280,6 +298,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 try? await Task.sleep(nanoseconds: 3_000_000_000)
                 env.workspace.open(url: URL(fileURLWithPath: target))
             }
+        }
+    }
+
+    /// 首帧之后再读会话里的文档。
+    ///
+    /// 为什么不在启动阶段读：冷启动时一次文件 `open(2)` 可能被系统拖到 5 秒以上
+    /// （主线程卡在 `libsystem_kernel.__open`，跨线程采样实证）。4 个标签就是 4 个坑，
+    /// 全压在启动阶段里意味着：窗口迟迟不出来，`didFinishLaunching` 也迟迟不返回，
+    /// 访达 / `open -a` 投递的打开事件 30 秒等不到应答 → -1712。
+    /// 现在窗口先画出来，标签随后补上（读盘本身在后台线程）。
+    private func restoreAfterFirstFrame(_ env: AppEnvironment) {
+        var fired = false
+        let fire: @MainActor () -> Void = { [weak self] in
+            guard !fired else { return }
+            fired = true
+            if let token = self?.firstFrameToken {
+                NotificationCenter.default.removeObserver(token)
+                self?.firstFrameToken = nil
+            }
+            LaunchProbe.mark("首帧后开始恢复会话")
+            env.workspace.performSessionRestore()
+        }
+        firstFrameToken = NotificationCenter.default.addObserver(
+            forName: NSWindow.didUpdateNotification, object: nil, queue: .main
+        ) { _ in
+            MainActor.assumeIsolated { fire() }
+        }
+        // 兜底：窗口因故没有 didUpdate 时也别让标签永远回不来
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            MainActor.assumeIsolated { fire() }
         }
     }
 

@@ -532,3 +532,63 @@ app.sendEvent(leftMouseDown)   → hitTest 次数=1, currentEvent=nil
 断言用真实 `NSWindow` + `NSView` 几何，不依赖真实鼠标。
 
 已知限制：触控板与单键鼠标没有中键，该功能对其无效（可用 ✕ 或 ⌘W）。
+
+---
+
+## 第十二轮：冷启动「29 秒空档 / -1712」排查（0.1.5）
+
+上一轮留下的观察：冷启动恢复多标签时，探针日志出现 29s 空档，与 Apple Event 30s 超时吻合，
+期间 `open -a` 报 -1712；运行期打开只要 0.09s。
+
+### 先解决「测不出来」
+
+既有探针（`OpenTrace` 帧采样、`TraceEvents` 通知订阅）都跑在主线程上。主线程一卡住，它们自己
+也不出字——日志里只剩一个无法归因的空档，分不清是「主线程被阻塞」「主线程空闲没事件」
+还是「进程还没跑到探针安装点」。新增 `LaunchProbe`：
+
+| 设计点 | 做法 | 解决什么 |
+|---|---|---|
+| 时间基准 | `proc_pidinfo` 取内核记录的进程启动时刻 | 把「exec 之后到第一行 Swift 代码」也算进时间线 |
+| 心跳 | 独立线程每 100ms 往主队列投一次往返 | 主线程卡住时它照样能写字 |
+| 归因 | `thread_get_state` 从别的线程读主线程 PC，`dladdr` 反查符号 | 直接给出「卡在哪个函数」，不用猜 |
+
+### 实测结果
+
+```
+[launch] +  468.3ms  AppEnvironment.init 进入
+[trace] mark ... open 开始 M0-技术预研任务书.md 6KB
+[trace] mark ... (Δ 5327.23ms) DocumentSession 建立（已读盘）   ← 6KB 文件读了 5.3 秒
+[launch] + 5943.0ms ⚠️ 主线程阻塞 5474ms
+         热点：libsystem_kernel.dylib:__open×47 | write×1 | os_unfair_lock_lock×1
+```
+
+同一个文件从终端直接运行进程读：**0.2ms**。所以慢的不是解析、不是渲染，是特定上下文里
+系统的文件打开动作（LS 启动 + 首次执行）。会话恢复有几个文件就是几个这样的坑，
+串行压在主线程的启动阶段 → `didFinishLaunching` 迟迟不返回 → 打开事件没人应答（-1712）。
+
+### 两条结构性修法
+
+1. `Workspace.open(url:)` 改异步：`nonisolated static loadFromDisk`（SE-0338，不继承调用者 actor）
+   读内容 + 尺寸，主线程只装配。`DocumentSession` 新增 `init(url:content:store:)`，
+   构造过程不碰文件系统。`openingPaths` 去重；`open(urls:)` 单 Task 顺序 await 保序。
+2. 会话恢复两段式：`prepareSessionRestore()` 只读元信息（几百字节，布局必须在首帧前定），
+   `performSessionRestore()` 在首个 `NSWindow.didUpdate` 之后执行（1s 兜底）。
+
+顺带：启动阶段用户主动打开的文件不再被恢复抢走活跃标签（判据不能用「恢复开始时 tabs 是否为空」，
+用户那份可能正在读盘、快照里还是空的）。
+
+### 验证
+
+| 场景 | 结果 |
+|---|---|
+| `didFinishLaunching` | +388 → **+329ms** |
+| 窗口首帧 | +498 → **+366ms** |
+| 冷启动带文件（4 次） | 95–122ms，无 -1712 |
+| 运行中打开 | 77–86ms，窗口 vis 全程 1 |
+| **FIFO 永久阻塞读盘** | 阻塞期间另开文件仍 **95ms 返回**，看门狗零次阻塞 |
+| 判别力反证 | 同一看门狗在旧构建上抓到 5474ms 阻塞 |
+
+自检 80 → **82 项全 PASS**：新增「读盘不在主线程同步完成」（改回同步立刻 FAIL）、
+「启动阶段只读元信息、不读文档」。
+
+**教训**：跑在主线程上的探针观测不到主线程卡死；要测「卡住」，心跳通道必须活在另一个线程上。

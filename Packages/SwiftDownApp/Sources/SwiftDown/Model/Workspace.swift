@@ -79,6 +79,18 @@ final class Workspace: ObservableObject {
     private let sessionStore: SessionStore
     private var persistWork: DispatchWorkItem?
 
+    /// 正在读盘中的路径（防止同一文件被并发打开两次）
+    private var openingPaths: Set<String> = []
+
+    /// 启动时会话恢复只取元信息，文档内容等首帧之后再由这里补上
+    private var pendingRestore: PersistedSession?
+
+    /// 恢复正在进行中（期间的 `open` 视为用户主动打开）
+    private var restoring = false
+
+    /// 启动阶段用户主动打开的文件（访达双击 / `open -a` 带参数）
+    private var launchRequestedPath: String?
+
     /// 自检专用会话目录（与用户真实会话文件隔离）
     static let selftestSessionDirectory = FileManager.default.temporaryDirectory
         .appendingPathComponent("SwiftDown-selftest-session", isDirectory: true)
@@ -132,7 +144,9 @@ final class Workspace: ObservableObject {
         // 自检默认从干净起点开始（否则会继承上一次跑出来的残留会话）；
         // 验证会话恢复时显式传 true。
         if restoreSessionOnInit {
-            restoreSession()
+            // 只读元信息（几百字节 JSON）：布局要在首帧前就位，否则窗口会先按默认布局
+            // 画一遍再跳成上次布局。文档内容推迟到首帧之后，见 performSessionRestore()。
+            prepareSessionRestore()
         }
         registerLifecycleObservers()
     }
@@ -170,10 +184,38 @@ final class Workspace: ObservableObject {
     // MARK: - 打开
 
     func open(urls: [URL]) {
-        for url in urls { open(url: url) }
+        for url in urls { noteLaunchRequest(url) }
+        // 同一个 Task 里逐个 await：多文件不会被并发读盘打乱标签顺序
+        Task { for url in urls { await performOpen(url) } }
     }
 
     func open(url: URL) {
+        noteLaunchRequest(url)
+        Task { await performOpen(url) }
+    }
+
+    /// 启动阶段（会话还没恢复完）用户主动打开的文件要记住：
+    /// 恢复结束时不能把活跃标签强行切回「上次退出时的那份」，用户点谁就该看着谁。
+    private func noteLaunchRequest(_ url: URL) {
+        guard pendingRestore != nil || restoring else { return }
+        launchRequestedPath = url.standardizedFileURL.path
+    }
+
+    /// 自检/工具用：等这次打开真正落地（读盘 + 挂标签）再返回
+    @discardableResult
+    func openAndWait(url: URL) async -> DocumentTab? {
+        await performOpen(url)
+    }
+
+    /// 打开文档的唯一实现。
+    ///
+    /// **读盘不在主线程**。冷启动时实测过：一次文件 `open(2)` 被系统拖到 5 秒以上，
+    /// 主线程卡在 `libsystem_kernel.__open`（看门狗跨线程采样确认）。会话恢复有几个文件
+    /// 就是几个这样的坑，全压在主线程的启动阶段里 → 窗口迟迟不出、访达投递的打开事件
+    /// 30 秒等不到应答，发送方报 -1712。现在主线程只做「挂标签」，读盘慢只表现为
+    /// 内容稍后出现，窗口、事件处理都不受影响。
+    @discardableResult
+    private func performOpen(_ url: URL) async -> DocumentTab? {
         let target = url.standardizedFileURL
         OpenTrace.shared.begin("open \(target.lastPathComponent)（触发前 active=\(NSApp.isActive ? 1 : 0)）")
 
@@ -183,27 +225,59 @@ final class Workspace: ObservableObject {
             // 已经在前台时不要重复激活：每次 activate 都会让系统重新排序/重绘窗口，
             // 视觉上就是一次不必要的闪动
             if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }
-            return
+            return existing
         }
+        // 同一个文件正在读盘中（连点两下、事件与恢复撞车）→ 不重复打开
+        guard !openingPaths.contains(target.path) else { return nil }
+        openingPaths.insert(target.path)
+        defer { openingPaths.remove(target.path) }
 
-        let size = DiskFileStore.fileSize(at: target)
-        OpenTrace.mark("open 开始 \(target.lastPathComponent) \(size / 1024)KB")
-        do {
-            let session = try DocumentSession(url: target, store: store)
-            OpenTrace.mark("DocumentSession 建立（已读盘）")
-            let tab = DocumentTab(session: session,
-                                  settings: settings,
-                                  isReadOnly: size > Self.readOnlyThreshold)
-            OpenTrace.mark("DocumentTab 构造完成")
-            attach(tab)
-            OpenTrace.mark("attach 完成")
+        OpenTrace.mark("open 开始 \(target.lastPathComponent)")
+        switch await Self.loadFromDisk(target) {
+        case .loaded(let content, let bytes):
+            OpenTrace.mark("读盘完成 \(bytes / 1024)KB")
+            let tab = makeTab(url: target, content: content, size: bytes)
             settings.noteOpened(target)
             OpenTrace.mark("noteOpened 完成")
-        } catch {
+            return tab
+        case .failed(let reason):
             alertMessage = AlertMessage(
                 title: "无法打开文件",
-                detail: "\(target.lastPathComponent)\n\(error.localizedDescription)"
+                detail: "\(target.lastPathComponent)\n\(reason)"
             )
+            return nil
+        }
+    }
+
+    /// 装配并挂上一个已读出内容的标签（内存操作，不碰文件系统）
+    @discardableResult
+    private func makeTab(url: URL, content: String, size: Int) -> DocumentTab {
+        let session = DocumentSession(url: url, content: content, store: store)
+        OpenTrace.mark("DocumentSession 建立")
+        let tab = DocumentTab(session: session,
+                              settings: settings,
+                              isReadOnly: size > Self.readOnlyThreshold)
+        OpenTrace.mark("DocumentTab 构造完成")
+        attach(tab)
+        OpenTrace.mark("attach 完成")
+        return tab
+    }
+
+    /// 读盘结果（Sendable：要从后台线程带回主线程）
+    enum DiskLoad: Sendable {
+        case loaded(text: String, bytes: Int)
+        case failed(reason: String)
+    }
+
+    /// `nonisolated async` 不继承调用者的 actor（SE-0338），所以这里天然跑在协作线程池上
+    nonisolated static func loadFromDisk(_ url: URL) async -> DiskLoad {
+        let store = DiskFileStore()
+        let bytes = DiskFileStore.fileSize(at: url)
+        do {
+            return .loaded(text: try store.load(from: url), bytes: bytes)
+        } catch {
+            let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            return .failed(reason: reason)
         }
     }
 
@@ -431,23 +505,48 @@ final class Workspace: ObservableObject {
 
     // MARK: - 会话恢复与持久化
 
-    func restoreSession() {
+    /// 第一段：只读会话元信息（布局 + 路径清单），不碰任何文档文件。
+    ///
+    /// 为什么拆两段：文档读盘在冷启动时可能被系统拖到秒级（见 `performOpen` 的注释），
+    /// 4 个标签就是 4 个坑。这段留在启动阶段只会延长「窗口出现」和
+    /// 「didFinishLaunching 完成」的时间，进而让访达投递的打开事件等到超时（-1712）。
+    /// 元信息只有一个几百字节的 JSON，读它 <1ms，布局因此仍能在首帧前定下来。
+    func prepareSessionRestore() {
         guard !restoredSession else { return }
         restoredSession = true
-
         let saved = sessionStore.load()
+        LaunchProbe.mark("会话元信息已读取 tabs=\(saved.tabPaths.count)")
         // 只有用户选择「记住上次布局」时，会话里的布局才覆盖默认布局
         if settings.restoreLastLayout,
            let mode = saved.viewMode,
            let parsed = ViewMode(rawValue: mode) {
             viewMode = parsed
         }
-        guard !saved.tabPaths.isEmpty else { return }
+        pendingRestore = saved
+    }
 
-        for path in Self.filterRestorablePaths(saved.tabPaths, dropTemporary: !Self.isSelfTest) {
+    /// 第二段：首帧之后调用，真正把标签读出来挂上。
+    func performSessionRestore() {
+        Task { await restoreNow() }
+    }
+
+    /// 可等待的恢复（首帧回调与自检共用）
+    func restoreNow() async {
+        guard let saved = pendingRestore else { return }
+        pendingRestore = nil
+        let paths = Self.filterRestorablePaths(saved.tabPaths, dropTemporary: !Self.isSelfTest)
+        guard !paths.isEmpty else { return }
+        await restore(paths: paths, activePath: saved.activePath)
+    }
+
+    private func restore(paths: [String], activePath: String?) async {
+        restoring = true
+        defer { restoring = false }
+
+        for path in paths {
             let url = URL(fileURLWithPath: path)
             if FileManager.default.fileExists(atPath: path) {
-                open(url: url)
+                await performOpen(url)
             } else {
                 // EX-06：文件不存在 → 占位标签
                 let session = DocumentSession.placeholder(url: url, reason: "文件不存在")
@@ -456,10 +555,21 @@ final class Workspace: ObservableObject {
             }
         }
 
-        if let activePath = saved.activePath,
-           let tab = tabs.first(where: { $0.url.path == activePath }) {
+        // 用户启动时主动点开的文件优先：把它挪到最后并激活。
+        // 判断依据不能用「恢复开始时 tabs 是否为空」——启动阶段用户的文件可能正好在
+        // 恢复过程中读盘完成并挂上，那时快照里还是空的，恢复结束时就会把活跃标签抢回
+        // 上次退出时的那份（实测：双击 A 启动，最后活跃的却是会话里的另一份）。
+        if let requested = launchRequestedPath,
+           let tab = tabs.first(where: { $0.url.path == requested }) {
+            tabs = tabs.filter { $0.id != tab.id } + [tab]
+            activeTabID = tab.id
+        } else if let activePath,
+                  let tab = tabs.first(where: { $0.url.path == activePath }) {
             activeTabID = tab.id
         }
+        TraceEvents.log("会话恢复完成 tabs=\(tabs.count) requested=\(launchRequestedPath?.split(separator: "/").last.map(String.init) ?? "-")")
+        launchRequestedPath = nil
+        schedulePersist()
     }
 
     private func schedulePersist() {
