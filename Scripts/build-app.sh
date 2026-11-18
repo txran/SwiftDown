@@ -12,12 +12,34 @@ PKG="$ROOT/Packages/SwiftDownApp"
 CONFIG="${1:-release}"
 # 产物放在 build/.dev/ 这个隐藏目录里。
 #
-# 为什么藏在点上：macOS 的「应用程序」（Spotlight 驱动的应用列表）会收录任何被索引的
-# .app bundle，但跳过以 . 开头的目录。开发产物若直接躺在 build/ 下，就会和
-# /Applications 里装好的那份并排出现成两个图标；放进隐藏目录后两者不再重复。
-# 对外的便捷路径 build/SwiftDown.app 保留为符号链接（符号链接同样不被索引）。
+# 为什么藏在点上：磁盘上只要存在第二份 .app，LaunchServices 就会把它认成「同一个应用的
+# 另一个拷贝」，启动台/聚焦里并排出现两个图标——与 /Applications 里有几个文件无关。
+# 但仅靠隐藏目录不够：实测 build/SwiftDown.app 这个符号链接会把内容暴露回索引，
+# 于是「SwiftDown Dev」仍然出现在启动台里。所以收尾要双保险（见脚本末尾）：
+#   1. 在 build/ 与 build/.dev/ 放 .metadata_never_index，让 Spotlight 跳过整棵树；
+#   2. lsregister -u 注销开发版的应用注册。
+# 注销只影响「按名字找应用」，`open -a <绝对路径>` 与直接执行二进制都不受影响。
 APP="$ROOT/build/.dev/SwiftDown.app"
 APP_LINK="$ROOT/build/SwiftDown.app"
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+
+# 清理开发产物。
+#
+# 为什么必须能清：只要 SwiftDown.app 这个 bundle 还躺在磁盘上，mds 扫描一次就会把它
+# 重新注册进 LaunchServices，启动台/聚焦里立刻多出一个「SwiftDown Dev」——
+# `.metadata_never_index` 拦不住已经建立过索引的目录，`lsregister -u` 也会在几十秒内被回填。
+# 实测唯一稳的做法是让磁盘上不再有第二份 bundle。
+if [ "$CONFIG" = "clean" ]; then
+    echo "▶ 清理开发产物"
+    "$LSREGISTER" -u "$APP" >/dev/null 2>&1 || true
+    "$LSREGISTER" -u "$APP_LINK" >/dev/null 2>&1 || true
+    rm -rf "$APP" "${APP}.dSYM" 2>/dev/null || true
+    rm -f "$APP_LINK" 2>/dev/null || true
+    killall Dock 2>/dev/null && echo "  Dock 已重启"
+    echo "✓ 已删除 $APP 并注销注册"
+    echo "  系统里现在只剩 /Applications/SwiftDown.app"
+    exit 0
+fi
 PLUGIN_PATH="/Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing"
 
 echo "▶ 编译 ($CONFIG)..."
@@ -74,7 +96,14 @@ if [ -e "$APP_LINK" ] && [ ! -L "$APP_LINK" ]; then
 fi
 ln -sfn ".dev/SwiftDown.app" "$APP_LINK"
 
+# 不让开发版出现在启动台 / 聚焦（见文件头注释）。
+# .metadata_never_index 是 Spotlight 的目录级排除标记，放在 build/ 与 build/.dev/ 各一份。
+touch "$ROOT/build/.metadata_never_index"
+touch "$ROOT/build/.dev/.metadata_never_index"
+"$LSREGISTER" -u "$APP" >/dev/null 2>&1 || true
+"$LSREGISTER" -u "$APP_LINK" >/dev/null 2>&1 || true
+
 echo "✓ 完成：$APP"
-echo "  快捷路径：${APP_LINK}（符号链接，不进 Spotlight）"
+echo "  快捷路径：${APP_LINK}（符号链接；已排除 Spotlight 索引并注销 LS 注册，不进启动台）"
 echo "  启动：open \"$APP\""
 echo "  自检：\"$APP/Contents/MacOS/SwiftDown\" --selftest <某个.md文件>"

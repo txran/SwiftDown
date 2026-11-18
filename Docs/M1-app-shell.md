@@ -643,3 +643,44 @@ lsregister -dump | grep SwiftDown   → 732 条命中
 
 **教训**：验证用的临时 app 必须换 bundle id，或者用完立刻删。只要同 id 的第二份文件在磁盘上
 （哪怕在 `/tmp`），系统就会认为应用有两份。以后涉及身份/图标的验证，跑完 `doctor-app.sh` 收尾。
+
+### 第十三轮补记：第二个图标其实是「SwiftDown Dev」
+
+清完 `/private/tmp` 后用户反馈仍有两个，其中一个带 dev 标签 —— 那是开发构建本身。
+
+排查过程里被否定的三个假设：
+
+| 假设 | 证据 | 结论 |
+|---|---|---|
+| Dock 里被固定了两份 | `defaults read com.apple.dock persistent-apps` 里 SwiftDown 出现 0 次 | 不是 Dock 固定项 |
+| 废纸篓副本被 Spotlight 收录 | `mdfind` 只返回 `/Applications/SwiftDown.app` | 不影响显示 |
+| 把目录藏起来就够 | `build/.dev` 已是隐藏目录，仍出现 | 隐藏目录不是充分条件 |
+
+真因链条：
+
+1. 只要 `SwiftDown.app` bundle 在磁盘上，mds 扫描就把它登记进 LaunchServices ——
+   **运行一次开发版也会立刻重新登记**（`lsregister -u` 后 `open -a` 一次，注册数 0 → 1）。
+2. `.metadata_never_index` 对**已经建立过索引**的目录无效，实测注销后 25～40 秒即被回填。
+3. 删除 `build/SwiftDown.app` 符号链接也没能阻止回填，所以链接不是元凶、保留即可。
+
+结论：靠「注销 + 藏起来」只能短暂压住，唯一稳定做法是**磁盘上不留第二份 bundle**。
+用户当时还同时开着正式版与开发版两个实例（截图菜单栏并排两组「SwiftDown Dev / SwiftDown」），
+这也是 Dock 上短暂出现两个图标的原因。
+
+### 最终处理
+
+- `Scripts/build-app.sh clean`：注销注册 → 删除 `build/.dev/SwiftDown.app` → 重启 Dock。
+- 构建脚本收尾保留「写 `.metadata_never_index` + 注销注册」，作为构建期间的减害措施，
+  但文档明确写：调试完要 `clean`。
+- `Scripts/doctor-app.sh` 把「开发版仍注册在 LaunchServices 里」列为告警项，`--fix` 会注销。
+
+复查（清理后 20 秒）：
+
+| 检查 | 结果 |
+|---|---|
+| LaunchServices 中存活副本 | 仅 `/Applications/SwiftDown.app` |
+| `mdfind` 应用 bundle 查询 | 仅 `/Applications/SwiftDown.app` |
+| 运行中实例 | 无 |
+
+**教训**：macOS 认应用看磁盘上有没有 bundle，不看它在哪、叫什么、是否隐藏。
+「同一个应用只留一份」的判据是文件系统，不是 LaunchServices 表。

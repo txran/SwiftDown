@@ -87,6 +87,19 @@ open build/SwiftDown.app
 > 这样做是为了避免两个同名同图标、同 bundle id 的副本同时被系统登记（会导致「应用程序」里
 > 出现两个图标、⌘Tab 里出现两个同款图标、以及「打开方式」指向不确定的那一份）。
 
+调试完记得清理：
+
+```bash
+./Scripts/build-app.sh clean
+```
+
+> **为什么必须清**：只要 `SwiftDown.app` 这个 bundle 还躺在磁盘上，mds 每扫描一次就会把它
+> 重新登记进 LaunchServices，启动台 / 聚焦里就多出一个「SwiftDown Dev」。
+> `.metadata_never_index` 拦不住已建过索引的目录，`lsregister -u` 也会在几十秒内被回填——
+> 实测唯一稳的办法是让磁盘上不再有第二份 bundle。清理后随时可以重新构建。
+>
+> 症状自查：`./Scripts/doctor-app.sh` 会列出所有游离副本与身份冲突。
+
 要发给别人用的发行包（产出 `.dmg` 与 `.zip` 到 `build/dist/`）：
 
 ```bash

@@ -41,8 +41,19 @@ if [ -d "$DEV_APP" ]; then
     if [ "$dev_id" = "$(bundle_id "$APPLICATIONS_APP")" ]; then
         echo "   ⚠️  开发版与正式版 bundle id 相同 —— 必然出现两个图标"
     fi
+    # 隐藏目录不够：只要它还在 LaunchServices 注册表里，启动台就会列出「SwiftDown Dev」
+    if $LSREG -dump 2>/dev/null | grep -Fq "$DEV_APP"; then
+        echo "   ⚠️  开发版仍注册在 LaunchServices 里 —— 启动台会多出一个 SwiftDown Dev"
+        if [ "$FIX" = "1" ]; then
+            $LSREG -u "$DEV_APP" 2>/dev/null
+            $LSREG -u "$ROOT/build/SwiftDown.app" 2>/dev/null
+            echo "     → 已注销开发版注册"
+        fi
+    else
+        echo "   ✓ 未注册，不会出现在启动台"
+    fi
 else
-    echo "   （未构建）"
+    echo "   （未构建 —— 这是理想状态：磁盘上只有正式版一份 bundle）"
 fi
 
 echo "== 3. 扫描游离副本 =="
@@ -82,6 +93,9 @@ rm -f /tmp/doctor-swiftdown-paths.txt
 
 if [ "$FIX" = "1" ]; then
     echo "== 4. 重新注册正式版并刷新 Dock =="
+    [ -d "$ROOT/build" ] && touch "$ROOT/build/.metadata_never_index"
+    [ -d "$ROOT/build/.dev" ] && touch "$ROOT/build/.dev/.metadata_never_index"
+    echo "   Spotlight 排除标记已就位（build/、build/.dev/）"
     [ -d "$APPLICATIONS_APP" ] && $LSREG -f "$APPLICATIONS_APP" && echo "   已重注册 $APPLICATIONS_APP"
     killall Dock 2>/dev/null && echo "   Dock 已重启（刷新 Launchpad 缓存）"
 fi
