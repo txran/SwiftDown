@@ -1,4 +1,5 @@
 import AppKit
+import CoreGraphics
 import Foundation
 import SwiftUI
 
@@ -461,6 +462,41 @@ enum SelfTest {
                   TabBarMetrics.maxWrapHeight == TabBarMetrics.rowHeight * 3,
                   "maxHeight=\(TabBarMetrics.maxWrapHeight)")
 
+            // 中键关闭标签：SwiftUI 没有中键手势，靠「透明覆盖层 + 窗口级监听」实现。
+            // 断言落到几何与事件两个要素上：中键抬起 + 落点在标签矩形内才关，
+            // 且覆盖层绝不能参与命中测试（否则左键点击会被它吃掉）。
+            let zoneWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 120),
+                                      styleMask: [.titled], backing: .buffered, defer: false)
+            let zone = MiddleClickZone(frame: NSRect(x: 10, y: 10, width: 120, height: 30))
+            let zoneID = UUID()
+            zoneWindow.contentView?.addSubview(zone)
+            MiddleClickCenter.register(id: zoneID, view: zone, action: {})
+            let zoneRect = zone.convert(zone.bounds, to: nil)
+            let insidePoint = NSPoint(x: zoneRect.midX, y: zoneRect.midY)
+            let outsidePoint = NSPoint(x: zoneRect.maxX + 40, y: zoneRect.midY)
+
+            check("FR-05 中键抬起落在标签内 → 关闭该标签",
+                  MiddleClickCenter.target(type: .otherMouseUp, buttonNumber: 2,
+                                           window: zoneWindow, point: insidePoint) == zoneID,
+                  "rect=\(NSStringFromRect(zoneRect))")
+            check("FR-05 中键落在标签外不关闭",
+                  MiddleClickCenter.target(type: .otherMouseUp, buttonNumber: 2,
+                                           window: zoneWindow, point: outsidePoint) == nil)
+            check("FR-05 左键/右键不会触发中键关闭",
+                  MiddleClickCenter.target(type: .leftMouseUp, buttonNumber: 0,
+                                           window: zoneWindow, point: insidePoint) == nil
+                  && MiddleClickCenter.target(type: .rightMouseUp, buttonNumber: 1,
+                                              window: zoneWindow, point: insidePoint) == nil)
+            check("FR-05 中键按下不算（抬起才关）",
+                  MiddleClickCenter.target(type: .otherMouseDown, buttonNumber: 2,
+                                           window: zoneWindow, point: insidePoint) == nil)
+            check("FR-05 中键覆盖层不参与命中测试（不抢左键/右键/拖拽）",
+                  zone.hitTest(insidePoint) == nil)
+            MiddleClickCenter.unregister(id: zoneID)
+            check("FR-05 注销后不再命中",
+                  MiddleClickCenter.target(type: .otherMouseUp, buttonNumber: 2,
+                                           window: zoneWindow, point: insidePoint) == nil)
+
             // 设置项持久化（切模式后重启仍生效）
             check("FR-07 标签栏样式默认单行", s1.tabBarStyle == .scroll, s1.tabBarStyle.label)
             s1.tabBarStyle = .wrap
@@ -516,6 +552,17 @@ enum SelfTest {
 
         print("=== 自检结束：\("通过 \(failures == 0 ? "全部" : "")，失败 \(failures) 项") ===")
         print("SELFTEST RESULT: \(failures == 0 ? "ALL PASS" : "\(failures) FAILED")")
+    }
+
+    /// 构造合成鼠标事件。
+    ///
+    /// 为什么不用 `NSEvent.mouseEvent(with:…)`：那个接口没有 `buttonNumber` 参数，
+    /// 造出来的永远是左键（0），验不出「中键被识别」。绕一层 CGEvent 才有真实的按键号。
+    static func syntheticMouseEvent(_ type: CGEventType, button: CGMouseButton) -> NSEvent? {
+        let source = CGEventSource(stateID: .combinedSessionState)
+        guard let cg = CGEvent(mouseEventSource: source, mouseType: type,
+                               mouseCursorPosition: .zero, mouseButton: button) else { return nil }
+        return NSEvent(cgEvent: cg)
     }
 
     /// 把视图离屏渲染为 PNG（实现在 `SnapshotRenderer`，与 `--render` 出图共用）
@@ -578,4 +625,9 @@ enum SelfTest {
         if case .conflict = tab.state { return true }
         return false
     }
+}
+
+/// 自检里跨闭包计数的最小容器（闭包内直接改局部 var 会触发并发检查）
+final class Counter {
+    var value = 0
 }

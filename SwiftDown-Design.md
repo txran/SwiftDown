@@ -420,6 +420,35 @@ AppKit 在启动阶段就分发 open 事件，装晚了第一份文件仍走 Swi
 
 ---
 
+**ADR-17 中键关闭标签：用「不参与命中测试的覆盖层 + 窗口级监听」，不用 `hitTest` 里读 `currentEvent`**（第十一轮）
+
+SwiftUI 没有中键手势，AppKit 也没有「既不抢左键、又能收到中键」的钩子。网上最常见的写法是给标签叠一层
+视图、在 `hitTest` 里判断 `NSApp.currentEvent` 是不是中键。**实测这条不成立**：
+
+| 调用方式 | hitTest 被调用 | 期间 `NSApp.currentEvent` |
+|---|---|---|
+| `NSWindow.sendEvent(leftMouseDown)` | 1 次 | **nil** |
+| `NSApplication.sendEvent(leftMouseDown)` | 1 次 | **nil** |
+
+拿不到「正在分发的是哪个键」，判定永远为假，功能静默失效——这种失效最难发现（点下去毫无反应，
+不报错、不崩溃）。
+
+采用的做法：
+
+1. **覆盖层完全不参与命中测试**（`hitTest → nil`）。标签现有的左键切换、右键菜单、拖拽排序、
+   滚轮滚动全部原样穿透，一个都不会被抢。这是「叠加一层」能安全存在的唯一前提。
+2. **窗口级本地监听器**收 `otherMouseUp` 且 `buttonNumber == 2`（抬起才关，按下后拖走等于取消）。
+3. **落点用当场算出的窗口矩形**（`view.convert(view.bounds, to: nil)`）。不缓存坐标：单行模式下
+   标签在 `ScrollView` 里横向滚动，缓存必然过期；多行模式换行、窗口缩放同理。
+
+自检不依赖真实鼠标：用真实 `NSWindow` + `NSView` 构造几何，直接断言 `target(type:buttonNumber:window:point:)`
+的返回。6 条断言覆盖「中键 + 抬起 + 落在标签内」这个合取条件，以及「覆盖层 hitTest 必须为 nil」。
+
+代价：`MiddleClickCenter` 是一个静态注册表（`[UUID: (weak view, action)]`），标签隐藏/移除必须
+`viewDidMoveToWindow` 里注销。用 weak view + 注销双保险，避免 SwiftUI 重建标签时泄漏。
+
+---
+
 **通用结论**：凡是渲染类能力，自检断言必须落到**内容**（编号数组 / 像素），只断言「视图对象存在」是无效断言；且自检不得改动被测对象的内部状态（见 ADR-09）。
 若要手工装配 `NSTextContentStorage` + `NSTextLayoutManager` 而不经 `NSTextView` 默认路径，会牵动高亮层对 `NSTextStorage` 的直接写入，M1 不做，留 M2 评估。
 

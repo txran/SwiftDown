@@ -214,14 +214,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func handleOpenDocuments(_ event: NSAppleEventDescriptor,
                                            withReplyEvent reply: NSAppleEventDescriptor) {
-        guard let direct = event.paramDescriptor(forKeyword: keyDirectObject) else { return }
         var urls: [URL] = []
-        for index in 1...max(1, direct.numberOfItems) {
-            guard let item = direct.atIndex(index) else { continue }
-            if let url = item.fileURLValue ?? URL(string: item.stringValue ?? "") {
-                urls.append(url)
+        if let direct = event.paramDescriptor(forKeyword: keyDirectObject) {
+            for index in 1...max(1, direct.numberOfItems) {
+                guard let item = direct.atIndex(index) else { continue }
+                if let url = item.fileURLValue ?? URL(string: item.stringValue ?? "") {
+                    urls.append(url)
+                }
             }
         }
+        // 必须先回复再干活：接管之后 AppKit 的默认处理不再执行，没人回复发送方
+        // （访达 / `open -a`）就会一直等到超时，实测表现为 -1712、双击文件后转圈。
+        // 回一个空错误列表 = 全部接收成功（真失败了才在该列表里放失败项）。
+        acknowledge(reply)
+
         guard !urls.isEmpty else { return }
         TraceEvents.log("apple-event open \(urls.map(\.lastPathComponent)) isActive=\(NSApp.isActive ? 1 : 0)")
         if let env {
@@ -229,6 +235,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             pendingURLs.append(contentsOf: urls)
         }
+    }
+
+    /// 发送方不要回复时（`descriptorType == typeNull`）不能碰 reply，否则会崩
+    private func acknowledge(_ reply: NSAppleEventDescriptor) {
+        guard reply.descriptorType != typeNull else { return }
+        reply.setDescriptor(NSAppleEventDescriptor.list(), forKeyword: keyDirectObject)
     }
 
     @MainActor

@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -164,6 +165,12 @@ struct TabBarView: View {
                 .onDrop(of: [.text],
                         delegate: TabDropDelegate(target: tab, workspace: workspace))
                 .onTapGesture { workspace.activate(tab) }
+                // 中键关闭（与 Safari / VS Code 一致）。SwiftUI 没有中键手势，
+                // 这层 AppKit 只在鼠标中键事件上参与命中，其余一律穿透。
+                .overlay(
+                    MiddleClickCatcher(tabID: tab.id) { workspace.requestClose(tab) }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                )
                 .contextMenu {
                     Button("复制文件路径") { PathPaster.copyFileURL(tab.url) }
                     Button("复制所在文件夹路径") { PathPaster.copyFolderPath(tab.url) }
@@ -301,5 +308,108 @@ private struct TabDropDelegate: DropDelegate {
     func performDrop(info: DropInfo) -> Bool {
         workspace.draggingTabID = nil
         return true
+    }
+}
+
+// MARK: - 中键关闭
+
+/// 中键点击标签 = 关闭标签（与 Safari / VS Code 一致）。
+///
+/// SwiftUI 没有中键手势，AppKit 也没有「既不抢左键、又能收到中键」的钩子：
+/// - `onTapGesture` 只认左键，`contextMenu` 只认右键；
+/// - 叠一层视图并在 `hitTest` 里判断 `NSApp.currentEvent` 是网上常见写法，但实测
+///   `NSApplication.sendEvent` / `NSWindow.sendEvent` 期间 `currentEvent` 都是 nil，
+///   拿不到「正在分发的是哪个键」，这条路不可靠。
+///
+/// 改成两半：叠一层**完全不参与命中测试**的透明视图（`hitTest → nil`，左键/右键/拖拽/
+/// 滚轮全部照常穿透），再用窗口级本地监听器收中键抬起，落点用视图当场算出的窗口矩形判断。
+/// 矩形每次事件现算，滚动、换行、窗口缩放都不会过期。
+@MainActor
+enum MiddleClickCenter {
+
+    private struct Entry {
+        weak var view: NSView?
+        var action: () -> Void
+    }
+
+    private static var entries: [UUID: Entry] = [:]
+    private static var monitor: Any?
+
+    static func register(id: UUID, view: NSView, action: @escaping () -> Void) {
+        entries[id] = Entry(view: view, action: action)
+        installMonitorIfNeeded()
+    }
+
+    static func unregister(id: UUID) {
+        entries[id] = nil
+    }
+
+    /// 这次事件该关闭哪个标签。抽成纯判定是为了让自检能用合成事件直接断言，
+    /// 不必真的动鼠标。`point` 用窗口坐标。
+    static func target(type: NSEvent.EventType,
+                       buttonNumber: Int,
+                       window: NSWindow?,
+                       point: NSPoint) -> UUID? {
+        guard type == .otherMouseUp, buttonNumber == 2, let window else { return nil }
+        for (id, entry) in entries {
+            guard let view = entry.view, view.window === window else { continue }
+            if view.convert(view.bounds, to: nil).contains(point) { return id }
+        }
+        return nil
+    }
+
+    private static func installMonitorIfNeeded() {
+        guard monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: [.otherMouseUp]) { event in
+            MainActor.assumeIsolated {
+                guard let id = target(type: event.type,
+                                      buttonNumber: event.buttonNumber,
+                                      window: event.window,
+                                      point: event.locationInWindow)
+                else { return event }
+                entries[id]?.action()
+                return nil      // 命中标签就吞掉，别让下层再把它当别的手势
+            }
+        }
+    }
+}
+
+/// 标签上的透明覆盖层：只登记自己，不参与任何鼠标事件。
+final class MiddleClickZone: NSView {
+
+    var tabID: UUID?
+    var action: (() -> Void)?
+
+    /// 永远让路：左键点击、右键菜单、拖拽、滚轮都直接穿到下层 SwiftUI 视图
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard let tabID else { return }
+        if window == nil {
+            MiddleClickCenter.unregister(id: tabID)
+        } else if let action {
+            MiddleClickCenter.register(id: tabID, view: self, action: action)
+        }
+    }
+}
+
+struct MiddleClickCatcher: NSViewRepresentable {
+    let tabID: UUID
+    let action: () -> Void
+
+    func makeNSView(context: Context) -> MiddleClickZone {
+        let view = MiddleClickZone()
+        view.tabID = tabID
+        view.action = action
+        return view
+    }
+
+    func updateNSView(_ view: MiddleClickZone, context: Context) {
+        view.action = action
+        // 闭包必须重登记，否则里面还是旧的 tab
+        if view.window != nil {
+            MiddleClickCenter.register(id: tabID, view: view, action: action)
+        }
     }
 }

@@ -16,7 +16,7 @@
 | **即时预览** | 输入停顿 200ms 后解析，标题、列表、表格、代码块、引用、行内样式全部支持 |
 | **大纲导航** | 按标题层级自动生成，点击跳转；随编辑实时刷新 |
 | **行号与高亮** | 按逻辑行编号，自动换行的续行不重复标号；标题/代码/引用/强调分色 |
-| **多标签** | 拖拽排序、右键菜单（复制路径 / 访达显示 / 关闭其他）；标签多了可切「单行滚动」或「多行换行」 |
+| **多标签** | 拖拽排序、右键菜单（复制路径 / 访达显示 / 关闭其他）、**鼠标中键点击即关闭**；标签多了可切「单行滚动」或「多行换行」 |
 | **自动保存** | 停止输入 2 秒落盘；失焦与退出前强制落盘 |
 | **外部修改保护** | 文件被其他程序改动时进入冲突态：编辑冻结、横幅提示，由你选择采用磁盘版 / 保留我的 / 另存副本 |
 | **主题** | 跟随系统 / 白天 / 黑夜，覆盖编辑器、预览、菜单与设置窗口 |
@@ -41,17 +41,17 @@
 
 不想自己编译就直接下发行版：[**Releases**](https://gitee.com/txran/swift-down/releases)
 
-当前版本 **0.1.3**：[发行说明](https://gitee.com/txran/swift-down/releases/tag/v0.1.3)
+当前版本 **0.1.4**：[发行说明](https://gitee.com/txran/swift-down/releases/tag/v0.1.4)
 
 | 文件 | 用法 |
 |---|---|
-| [`SwiftDown-0.1.3-arm64.dmg`](https://gitee.com/txran/swift-down/releases/download/v0.1.3/SwiftDown-0.1.3-arm64.dmg) | 打开后把 SwiftDown 拖进「应用程序」 |
-| [`SwiftDown-0.1.3-arm64.zip`](https://gitee.com/txran/swift-down/releases/download/v0.1.3/SwiftDown-0.1.3-arm64.zip) | 解压即用，适合脚本化下载 |
+| [`SwiftDown-0.1.4-arm64.dmg`](https://gitee.com/txran/swift-down/releases/download/v0.1.4/SwiftDown-0.1.4-arm64.dmg) | 打开后把 SwiftDown 拖进「应用程序」 |
+| [`SwiftDown-0.1.4-arm64.zip`](https://gitee.com/txran/swift-down/releases/download/v0.1.4/SwiftDown-0.1.4-arm64.zip) | 解压即用，适合脚本化下载 |
 
 ```bash
 # 命令行安装（不想拖拽时）
 curl -L -o /tmp/SwiftDown.zip \
-  https://gitee.com/txran/swift-down/releases/download/v0.1.3/SwiftDown-0.1.3-arm64.zip
+  https://gitee.com/txran/swift-down/releases/download/v0.1.4/SwiftDown-0.1.4-arm64.zip
 ditto -x -k /tmp/SwiftDown.zip /Applications
 xattr -dr com.apple.quarantine /Applications/SwiftDown.app
 ```
@@ -132,7 +132,7 @@ Packages/
 │                         唯一写盘入口，冲突期写入冻结（23 个单测）
 ├── SwiftDownPipeline/    Markdown 解析：swift-markdown → 与渲染无关的抽象 AST（18 个单测）
 ├── SwiftDownEditorKit/   编辑器内核：分块行索引、差量撤销、语法辅助（25 个单测）
-└── SwiftDownApp/         SwiftUI 壳 + AppKit 编辑渲染 + 自检与出图（74 项端到端断言）
+└── SwiftDownApp/         SwiftUI 壳 + AppKit 编辑渲染 + 自检与出图（80 项端到端断言）
 ```
 
 设计取舍见 [SwiftDown-Design.md](SwiftDown-Design.md) 的 ADR 列表（文本引擎、行索引、冲突写入冻结、模态呈现约束等）。
@@ -150,7 +150,7 @@ swift test --disable-sandbox \
 
 `--disable-sandbox` 是必需的：SPM 的插件沙箱在没有完整 Xcode 的环境下会拒绝加载 swift-testing 宏插件。
 
-端到端自检（每次改动后跑一遍，输出 74 项 PASS/FAIL）：
+端到端自检（每次改动后跑一遍，输出 80 项 PASS/FAIL）：
 
 ```bash
 ./Scripts/build-app.sh release

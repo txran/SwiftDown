@@ -494,3 +494,41 @@ open -a /Applications/SwiftDown.app a.md      # 由系统启动，才能复现�
 open -a Finder && open -a /Applications/SwiftDown.app b.md
 rm /tmp/swiftdown-trace.on
 ```
+
+### 第十一轮：中键点击标签关闭
+
+需求：鼠标中键点标签就关（Safari / VS Code 的手感），不改动现有的左键切换、右键菜单、拖拽排序。
+
+SwiftUI 没有中键手势。先试了「叠一层视图，在 `hitTest` 里读 `NSApp.currentEvent` 判断是哪个键」——
+这是网上最常见的写法，但**实测不成立**：
+
+```swift
+// 探针：NSWindow + 自定义 NSView，记录 hitTest 期间能否读到 currentEvent
+win.sendEvent(leftMouseDown)   → hitTest 次数=1, currentEvent=nil
+app.sendEvent(leftMouseDown)   → hitTest 次数=1, currentEvent=nil
+```
+
+`NSApplication.sendEvent` / `NSWindow.sendEvent` 期间 `currentEvent` 都是 nil，拿不到按键号。
+（另外 `NSEvent.mouseEvent(with:…)` 没有 `buttonNumber` 参数，合成事件永远是左键；
+要造真实按键号得走 `CGEvent(mouseButton: .center)` → `NSEvent(cgEvent:)`，
+但那条路 `windowNumber` 恒为 0，投不进任何窗口。）
+
+最终实现分两半：
+
+| 组件 | 职责 | 关键点 |
+|---|---|---|
+| `MiddleClickZone`（NSView） | 每个标签叠一层 | `hitTest → nil`，**完全不参与命中测试**，左键/右键/拖拽/滚轮照常穿透 |
+| `MiddleClickCenter` | 窗口级本地监听 + 落点判定 | 只收 `otherMouseUp` 且 `buttonNumber == 2`；矩形用 `view.convert(view.bounds, to: nil)` **当场算**，滚动/换行/缩放都不会过期 |
+
+矩形不缓存是刻意的：单行模式下标签在 `ScrollView` 里横向滚动，缓存的坐标必然过期；
+`convert(bounds, to: nil)` 每次给的都是当前窗口坐标。
+
+顺带修掉一个 0.1.3 引入的问题：接管 `kAEOpenDocuments` 之后 AppKit 的默认处理不再执行，
+**没人回复发送方**。实测连续 `open -a` 会报 `-1712`（Apple Event 超时）。现在解析完 URL 先回一个
+空错误列表（`descriptorType == typeNull` 时不能碰 reply），再异步打开。
+
+自检 74 → **80 项全 PASS**，新增 6 条：中键抬起 + 落在标签内才命中、落在外不命中、
+左键/右键不命中、中键按下（非抬起）不命中、覆盖层 `hitTest` 必须返回 nil、注销后不再命中。
+断言用真实 `NSWindow` + `NSView` 几何，不依赖真实鼠标。
+
+已知限制：触控板与单键鼠标没有中键，该功能对其无效（可用 ✕ 或 ⌘W）。
