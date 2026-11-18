@@ -183,6 +183,7 @@ swift test --disable-sandbox \
 - [SwiftDown-Design.md](SwiftDown-Design.md) — 架构设计与 ADR
 - [Docs/M1-app-shell.md](Docs/M1-app-shell.md) — M1 落地记录与自检基线
 - [Docs/macOS-Swift-踩坑总结.md](Docs/macOS-Swift-踩坑总结.md) — macOS（Swift/SwiftUI/AppKit）开发踩坑总结
+- [Docs/macOS-应用起步清单.md](Docs/macOS-应用起步清单.md) — 新 macOS 项目立项该定的 20 个决策
 
 ## License
 
