@@ -64,9 +64,17 @@ $LSREG -dump 2>/dev/null \
     | sort -u > /tmp/doctor-swiftdown-paths.txt
 
 stray=0
+trash=0
 while IFS= read -r p; do
     case "$p" in
         "$APPLICATIONS_APP"|"$DEV_APP") continue ;;
+        # 废纸篓里的历史副本会被 mds 反复回填注册，但 mdfind 不返回它们，
+        # 启动台/聚焦都不显示，因此只做统计、不计入告警（也不删用户文件）。
+        "/Users/$USER/.Trash/"*|"$HOME/.Trash/"*)
+            trash=$((trash + 1))
+            [ "$FIX" = "1" ] && $LSREG -u "$p" 2>/dev/null
+            continue
+            ;;
     esac
     stray=$((stray + 1))
     if [ -e "$p" ]; then
@@ -89,6 +97,7 @@ while IFS= read -r p; do
 done < /tmp/doctor-swiftdown-paths.txt
 
 [ "$stray" = "0" ] && echo "   ✓ 没有游离副本"
+[ "$trash" != "0" ] && echo "   · 废纸篓里有 $trash 条历史注册，不进 Spotlight、不影响显示（未动文件）"
 rm -f /tmp/doctor-swiftdown-paths.txt
 
 if [ "$FIX" = "1" ]; then
