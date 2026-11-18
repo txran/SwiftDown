@@ -320,6 +320,10 @@ PRD §FR-07 只要求主题与字体，这里的设置面板属于**用户追加
 
 ## 五之七、打开第二个文件时「闪一下」的定位与修复（第七轮，已改代码）
 
+> **后记（第十轮）：本节第七轮的归因也是错的。** 真正的原因是 SwiftUI 在外部打开事件里
+> 先 `-[NSWindow _close]` 再激活窗口，见文末「第十轮」。本节的视图复用改动保留（它本身
+> 是对的架构），但「这就是闪的来源」这个判断已被帧级探针推翻——换文档全程没有白帧。
+
 现象：应用运行中从访达双击另一个 `.md`，窗口会闪一下。
 
 ### 第六轮的误判
@@ -432,3 +436,61 @@ mdfind "kMDItemCFBundleIdentifier == 'dev.swiftdown.app'"
 报 `APP_LINK?: unbound variable`。写成 `${APP_LINK}` 或让括号不紧跟变量。
 
 自检仍为 72 项全 PASS（开发版走新身份、走符号链接路径都能通过）。
+
+### 第十轮：闪一下的真因 —— SwiftUI 自己关了一次窗口
+
+反馈：「已经一个应用了，但打开 app 的情况下再打开其他 md 还是会闪一下，像关闭重开，可 PID 没变。」
+PID 不变这一句把范围压到了「画面被重置」，而不是进程重启。
+
+前两轮的两次误判，写在这里当反面教材：
+
+| 轮次 | 结论 | 依据 | 为什么错 |
+|---|---|---|---|
+| 第六轮 | macOS 应用激活过渡 | `screencapture -l` 连拍 | 单帧百毫秒级，抓不到 16.7ms 的帧，工具本身没有判别力 |
+| 第七轮 | `.id(tab.id)` 重建视图漏白帧 | 代码推理 | 帧级探针显示全程 `alpha=1`、`vis=1`、像素无白帧，推理没被验证 |
+
+本轮做法：事件级探针（新文件 `Infra/TraceEvents.swift`）订阅窗口/应用通知，并在
+`isVisible == false` 的瞬间打印 `Thread.callStackSymbols`。栈很干脆：
+
+```
+-[NSWindow _close]
+  ← SwiftUI.AppWindowsController.activateWindowForExternalEvent(matching:handler:)
+  ← SwiftUI.AppWindowsController.open(urls:)
+  ← SwiftUI.AppDelegate.application(_:open:)
+```
+
+**SwiftUI 在处理外部打开事件时，会先把当前窗口关掉，再为文档激活窗口。**
+单窗口 + 自管标签的结构里这步纯属多余，屏幕上的表现就是一闪。
+
+试过但无效：
+
+- `.handlesExternalEvents(matching: ["*"])` —— 只对 `WindowGroup` 生效，单 `Window` 上是空操作，实测照样闪。
+- `window.isRestorable = false` —— 不是原因，实测照样闪。
+
+采用：`AppDelegate.applicationWillFinishLaunching` 里用 `NSAppleEventManager` 接管
+`kAEOpenDocuments`，自己解析 `keyDirectObject` 塞给 `Workspace`。SwiftUI 收不到事件，也就没得关。
+必须装在 `willFinishLaunching`：AppKit 在启动阶段就分发 open 事件，装晚了第一份文件还是走 SwiftUI。
+
+实测（发行版二进制 + `--trace` 逐帧采样）：
+
+| 场景 | `vis=0` 次数 |
+|---|---|
+| 运行中打开另一个 md | 1 → **0** |
+| 连续打开 3 个文件 | 3 → **0** |
+| 冷启动打开文件 | 内容正常（启动期窗口尚未上屏，不计） |
+
+同时修掉一个测试中暴露的真实小洞：`isTemporaryPath` 只比对 `NSTemporaryDirectory()`
+（`/var/folders/…/T`），漏了 `/tmp`。打开过 `/tmp/*.md` 之后这些路径会写进 `session.json`，
+下次启动恢复出几个已不存在的标签——就是之前处理过的「幽灵标签」。现在 `/tmp` 与 `/private/tmp` 一并算临时。
+
+自检 72 → **74 项全 PASS**，新增两条：`FR-05 已接管打开文稿事件`（反向验证：去掉接管立即 FAIL）、
+`FR-05 /tmp 下的路径同样视为临时`。
+
+探针用法（正常启动零开销，标记文件删掉即彻底关闭）：
+
+```bash
+touch /tmp/swiftdown-trace.on                 # 打开探针，日志写 /tmp/swiftdown-trace.log
+open -a /Applications/SwiftDown.app a.md      # 由系统启动，才能复现「访达打开」事件
+open -a Finder && open -a /Applications/SwiftDown.app b.md
+rm /tmp/swiftdown-trace.on
+```

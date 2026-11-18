@@ -27,6 +27,7 @@ final class OpenTrace {
         ProcessInfo.processInfo.environment["SWIFTDOWN_TRACE"] == "1"
             || CommandLine.arguments.contains("--trace-open")
             || CommandLine.arguments.contains("--trace")
+            || TraceLog.isOn
     }
 
     func begin(_ name: String) {
@@ -77,7 +78,7 @@ final class OpenTrace {
         [trace] ===== end \(label) =====
 
         """
-        FileHandle.standardError.write(out.data(using: .utf8) ?? Data())
+        TraceLog.write(out)
     }
 
     // MARK: - 分段计时（排查主线程阻塞用）
@@ -87,6 +88,7 @@ final class OpenTrace {
         ProcessInfo.processInfo.environment["SWIFTDOWN_TRACE"] == "1"
         || CommandLine.arguments.contains("--trace-open")
         || CommandLine.arguments.contains("--trace")
+        || TraceLog.isOn
 
     nonisolated(unsafe) private static var lastMark: CFTimeInterval = 0
 
@@ -97,7 +99,7 @@ final class OpenTrace {
         let delta = lastMark == 0 ? 0 : (now - lastMark) * 1000
         lastMark = now
         let line = String(format: "[trace] mark %7.2fms (Δ%7.2fms) %@\n", now, delta, label)
-        FileHandle.standardError.write(line.data(using: .utf8) ?? Data())
+        TraceLog.write(line)
     }
 
     // MARK: - 采样

@@ -297,15 +297,18 @@ PRD 只写了「标签栏支持多标签」，没规定溢出行为。实现上�
 布局判断抽成纯函数（`TabBarMetrics.needsArrows` / `wrappedRowCount`），自检用数字断言，
 渲染结果再用离屏快照兜住观感——这是「能断言的别靠肉眼」的延续。
 
-**ADR-13 换文档靠「复用同一个编辑器实例」，不重建视图**（第七轮修正，推翻第六轮的「不做」结论）
+**ADR-13 换文档靠「复用同一个编辑器实例」，不重建视图**（第七轮定，第九轮修正归因）
 
 第六轮曾尝试去掉 `.id(tab.id)` 做原地换文档，失败后写下了「这条路不可行」。第七轮重新定位后判定：
-**当时的两个障碍不是结构性的，是可解的**，而「闪一下」的真正来源恰恰就是 `.id(tab.id)`——它让 AppKit
-视图跨一个 CA 事务「先拆后装」，中间必然漏出一帧未挂载的空白。其他编辑器（TextEdit / VS Code / Typora）
-之所以不闪，是因为它们切换文档时**从不销毁编辑器**，只替换文本存储。
+**当时的两个障碍不是结构性的，是可解的**，于是改为复用：`RootView` 不再给 `EditorView` 挂 `.id`，
+切换由 `EditorView.updateNSView` 的 `tabChanged` 分支调用 `Coordinator.adopt(_:)` 完成。
+其他编辑器（TextEdit / VS Code / Typora）切换文档时也从不销毁编辑器，只替换文本存储，架构上一致。
 
-现在 `RootView` 不再给 `EditorView` 挂 `.id`，切换由 `EditorView.updateNSView` 的 `tabChanged` 分支
-调用 `Coordinator.adopt(_:)` 完成。第六轮的两个坑及其解法：
+**归因修正（第九轮）**：第七轮曾断言「闪一下」的真正来源就是 `.id(tab.id)`。这个结论**没有证据支持**——
+帧级探针（ADR-15）显示换文档全程 `alpha=1`、`vis=1`、内容区像素里没有白帧。
+真正的来源是 SwiftUI 在外部打开事件里自己关了一次窗口（见 ADR-15）。
+复用仍然保留，理由换成它本来的那个：切文档不该重建整棵 AppKit 视图树（`NSScrollView` / `NSTextView` /
+`NSTextStorage` / 标尺），也不该让两套状态机靠重建来对齐。第六轮的三个坑及其解法：
 
 - **标尺宽度晚一帧**：`ruleThickness` 原本只在 `drawHashMarksAndLabels` 里更新，于是「标尺变宽」比
   「文本区重排」晚，换文档（位数 2 → 4）时能看到横向跳动。新增 `LineNumberRulerView.prepareForNewDocument()`，
@@ -370,6 +373,50 @@ LaunchServices 里还累积了 108 条注册记录（多轮复制与 `lsregister
 
 副作用：开发版换 id 后 UserDefaults 是新的域（主题、最近打开不继承）。这是预期的——
 若继续共用域，系统又会把它当成同一个应用。
+
+---
+
+**ADR-16 外部打开文稿必须自己接管 `kAEOpenDocuments`，不让 SwiftUI 处理**（第十轮，调用栈实证）
+
+现象：应用已在前台，从访达双击另一个 `.md`，窗口闪一下、像关闭又重开，但 PID 不变。
+
+前两轮的两次误判都记在这里，避免再走一遍：
+- 第六轮判「macOS 应用激活过渡」——依据是 `screencapture` 连拍。单帧是百毫秒级，抓不到 16.7ms 的帧，**工具判别力不足**。
+- 第七轮判「`.id(tab.id)` 重建视图漏出空白帧」——依据是代码推理。帧级探针（`alpha` / `isVisible` / 窗口号 / 内容区像素）显示没有白帧，**推理未验证**。
+
+第十轮改用事件级探针订阅窗口通知，发现窗口 `isVisible` 在打开瞬间从 1 → 0 → 1（约 2ms），
+并直接在 `isVisible == false` 的瞬间打印调用栈：
+
+```
+-[NSWindow _close]
+  ← SwiftUI.AppWindowsController.activateWindowForExternalEvent(matching:handler:)
+  ← SwiftUI.AppWindowsController.open(urls:)
+  ← SwiftUI.AppDelegate.application(_:open:)
+```
+
+即：**SwiftUI 收到外部打开事件后，认为当前窗口不匹配该事件，先关掉窗口再为文档激活窗口。**
+在单窗口 + 自管标签的结构里，这个行为纯属多余，且必然表现为一闪。
+
+试过但无效的两条路（都记录在案，别重复踩）：
+- `.handlesExternalEvents(matching:)`：只对 `WindowGroup` 生效，单 `Window` 场景上是空操作，实测窗口照样被关。
+- `window.isRestorable = false`：不是原因，实测仍闪。
+
+采用的做法：在 `applicationWillFinishLaunching` 里用 `NSAppleEventManager` 接管
+`kAEOpenDocuments`，自己解析 `keyDirectObject` 里的文件 URL 交给 `Workspace`。
+SwiftUI 收不到这个事件，也就没有「关窗口」这一步。必须装在 `willFinishLaunching`——
+AppKit 在启动阶段就分发 open 事件，装晚了第一份文件仍走 SwiftUI 那条路。
+
+效果（`--trace` 逐帧采样，发行版二进制实测）：
+
+| 场景 | 窗口 `isVisible` 掉到 0 的次数 |
+|---|---|
+| 运行中打开另一个 md | 修复前 1 次 → 修复后 **0 次** |
+| 连续打开 3 个文件 | 修复前 3 次 → 修复后 **0 次** |
+| 冷启动打开文件 | 正常（启动期窗口本来就还没上屏，不计） |
+
+自检侧的防线是一条看似很弱的断言——「是否已接管 `kAEOpenDocuments`」。它防的不是逻辑错误，
+而是**这个接管被后人删掉**：删掉后文件照样能打开、功能看起来一切正常，只有闪一下会悄悄回来。
+已反向验证：去掉接管，这条立即 FAIL。
 
 ---
 

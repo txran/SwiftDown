@@ -189,9 +189,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendingURLs: [URL] = []
     private var didRunSelfTest = false
 
+    /// 是否已接管 kAEOpenDocuments。自检用它防回归：这段一旦被删掉，
+    /// 「打开文件闪一下」会原样回来，而且没有任何其他断言能发现。
+    nonisolated(unsafe) private(set) static var didTakeOverOpenDocuments = false
+
+    /// 抢在 SwiftUI 之前接管「打开文稿」的 Apple Event。
+    ///
+    /// 为什么必须抢：SwiftUI 的 `AppWindowsController.open(urls:)` 在处理外部打开事件时，
+    /// 会先把当前窗口 `-[NSWindow _close]` 掉，再为文档激活窗口（调用栈实测确认）。
+    /// 结果就是窗口 isVisible 从 1 掉到 0 再回来——用户看到的就是「闪一下，像关掉又重开」。
+    /// 我们自己做多标签，只需要把文件塞进 Workspace，绝不能让它去关窗口。
+    ///
+    /// 必须装在 `applicationWillFinishLaunching`：AppKit 在启动阶段就分发 open 事件，
+    /// 装晚了第一份文件还是会走 SwiftUI 那条路。
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        NSAppleEventManager.shared().setEventHandler(
+            self,
+            andSelector: #selector(handleOpenDocuments(_:withReplyEvent:)),
+            forEventClass: AEEventClass(kCoreEventClass),
+            andEventID: AEEventID(kAEOpenDocuments)
+        )
+        AppDelegate.didTakeOverOpenDocuments = true
+    }
+
+    @objc private func handleOpenDocuments(_ event: NSAppleEventDescriptor,
+                                           withReplyEvent reply: NSAppleEventDescriptor) {
+        guard let direct = event.paramDescriptor(forKeyword: keyDirectObject) else { return }
+        var urls: [URL] = []
+        for index in 1...max(1, direct.numberOfItems) {
+            guard let item = direct.atIndex(index) else { continue }
+            if let url = item.fileURLValue ?? URL(string: item.stringValue ?? "") {
+                urls.append(url)
+            }
+        }
+        guard !urls.isEmpty else { return }
+        TraceEvents.log("apple-event open \(urls.map(\.lastPathComponent)) isActive=\(NSApp.isActive ? 1 : 0)")
+        if let env {
+            Task { @MainActor in env.workspace.open(urls: urls) }
+        } else {
+            pendingURLs.append(contentsOf: urls)
+        }
+    }
+
     @MainActor
     func attach(_ env: AppEnvironment) {
         guard self.env == nil else { return }
+        TraceEvents.install()
         self.env = env
         if !pendingURLs.isEmpty {
             env.workspace.open(urls: pendingURLs)
@@ -237,6 +280,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func application(_ application: NSApplication, open urls: [URL]) {
         let files = urls.filter { !$0.hasDirectoryPath }
         guard !files.isEmpty else { return }
+        TraceEvents.log("app open urls=\(files.map(\.lastPathComponent)) isActive=\(NSApp.isActive ? 1 : 0) envReady=\(env != nil ? 1 : 0)")
         if let env {
             Task { @MainActor in env.workspace.open(urls: files) }
         } else {

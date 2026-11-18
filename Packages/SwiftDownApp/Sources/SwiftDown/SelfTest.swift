@@ -244,6 +244,19 @@ enum SelfTest {
         check("FR-05 标签切换耗时 ≤50ms", switchMS < 50, String(format: "%.2fms", switchMS))
         try? await Task.sleep(nanoseconds: 300_000_000)
 
+        // 6.5.0 「运行中从访达打开另一个 md 会闪一下」的真因与防线。
+        //
+        //   真因不在我们自己的视图层：SwiftUI 的 AppWindowsController.open(urls:)
+        //   在处理外部打开事件时会先 `-[NSWindow _close]` 再为文档激活窗口
+        //   （调用栈实测确认），窗口 isVisible 掉到 0 再回来，屏幕上就是一闪。
+        //   现在由 AppDelegate 在 applicationWillFinishLaunching 里接管 kAEOpenDocuments，
+        //   SwiftUI 收不到这个事件，只把文件塞进 Workspace 走标签。
+        //
+        //   这条断言防的是「接管被删掉」：删了它功能看起来依旧（文件还能打开），
+        //   但闪一下会原样回来，没有别的手段能发现。
+        check("FR-05 已接管打开文稿事件（否则窗口会被 SwiftUI 先关再开）",
+              AppDelegate.didTakeOverOpenDocuments)
+
         // 6.5.1 切标签必须复用同一个编辑器实例。
         //   曾经在 RootView 上写 `.id(tab.id)` 强制重建整棵编辑区，
         //   AppKit 视图「旧的已拆、新的未挂」之间会漏出一帧空白，
@@ -316,6 +329,12 @@ enum SelfTest {
               "过滤后=\(Workspace.filterRestorablePaths([tempSample, realSample], dropTemporary: true))")
         check("FR-05 自检进程内不过滤临时路径（自检文件本就在临时目录）",
               Workspace.filterRestorablePaths([tempSample], dropTemporary: false) == [tempSample])
+        // /tmp 与 NSTemporaryDirectory() 不是同一个路径：只比后者会漏掉手工放 /tmp 的文件，
+        // 实测那些路径会写进 session.json，下次启动变成恢复不出来的幽灵标签。
+        check("FR-05 /tmp 下的路径同样视为临时（不写进会话）",
+              Workspace.isTemporaryPath("/tmp/swiftdown-probe.md")
+              && Workspace.isTemporaryPath("/private/tmp/swiftdown-probe.md")
+              && !Workspace.isTemporaryPath(realSample))
 
         // 7. 关闭干净标签
         workspace.requestClose(tab)

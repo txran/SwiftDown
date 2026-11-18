@@ -232,6 +232,7 @@ struct EditorView: NSViewRepresentable {
         /// 这里改成与 TextEdit / VS Code 一致的做法：编辑器实例存活，
         /// 只替换 textStorage 内容，并把瞬态状态（撤销栈、选区、滚动）重置。
         func adopt(_ newTab: DocumentTab) {
+            TraceEvents.log("adopt → \(newTab.displayName)")
             tab = newTab
             revision = newTab.revision
             // 跨文档的跳转令牌没有可比性，不同步会让新文档被误判成「要跳转」

@@ -96,10 +96,18 @@ final class Workspace: ObservableObject {
         return paths.filter { !isTemporaryPath($0) }
     }
 
-    /// 路径是否落在系统临时目录内（自检产物一律在此）
+    /// 路径是否落在系统临时目录内（自检产物、CLI 出图、调试用文件一律在此）
+    ///
+    /// 注意 `/tmp` 不等于 `NSTemporaryDirectory()`：后者是 `/var/folders/…/T`。
+    /// 只比 NSTemporaryDirectory 会漏掉手工放在 `/tmp` 的测试文件——
+    /// 实测打开过 `/tmp/*.md` 之后，这些路径会被写进 session.json，
+    /// 下次启动就恢复出几个已经不存在的标签（用户侧表现是「幽灵标签」）。
     static func isTemporaryPath(_ path: String) -> Bool {
+        let resolved = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
         let temp = URL(fileURLWithPath: NSTemporaryDirectory()).resolvingSymlinksInPath().path
-        return URL(fileURLWithPath: path).resolvingSymlinksInPath().path.hasPrefix(temp)
+        if resolved.hasPrefix(temp) { return true }
+        // resolvingSymlinksInPath 会把 /tmp 归一成 /private/tmp，两个前缀都判一次
+        return resolved.hasPrefix("/private/tmp/") || resolved.hasPrefix("/tmp/")
     }
 
     /// >20MB 走只读源码模式（FR-01 / EX-02）
