@@ -10,7 +10,7 @@
 | 日期 | 2026-11-17 |
 | 评审记录 | 待评审（首轮） |
 
-**覆盖声明**：本文档覆盖 PRD 全部本期需求（FR-01~FR-09）与非功能需求（NFR-01~NFR-06）及异常清单（EX-01~EX-08）的设计决策与实现路径；FR-10（导出 HTML/PDF）为版本池项，不做设计。
+**覆盖声明**：本文档覆盖 PRD 全部本期需求（FR-01~FR-09）与非功能需求（NFR-01~NFR-06）及异常清单（EX-01~EX-08）的设计决策与实现路径；FR-10（导出 HTML/PDF）为版本池项，不做设计。另含一项 **SR（查找与替换）**——用户直接追加、不在 PRD 需求表内，见 §4.11。
 
 ---
 
@@ -525,9 +525,102 @@ SwiftUI 没有中键手势，AppKit 也没有「既不抢左键、又能收到�
 
 
 
+### 4.11 查找与替换（SR，第十四轮追加，用户直接提的需求）
+
+编号记作 **SR**（Search & Replace），不复用 `FR-10`：PRD 里的 FR-10 是「导出 HTML / PDF」，
+仍在版本池；查找替换属于 PRD 需求表之外的用户追加项，沿用 FR 编号会让两边串号（自检里一度就串了）。
+
+#### 分层
+
+| 层 | 类型 | 职责 | 刻意不做什么 |
+|---|---|---|---|
+| 内核 | `FindEngine`（enum，纯函数） | 大小写 / 整词 / 正则匹配、行号计算、正则合法性校验、命中上限 | 不持状态、不认识标签与视图 |
+| 状态 | `SearchController`（`@MainActor ObservableObject`） | 查询词、选项、范围、替换词、命中表、当前序号、正则错误 | 不碰编辑器、不碰文件 |
+| 界面 | `FindBar` / `FindBarHost`（SwiftUI） | 两行输入 + 计数 + 上下跳转 + 选项开关 + 跨标签结果列表 | 不直接调编辑器 |
+| 装配 | `Workspace` | 把「当前标签命中表」折算成 `SearchOverlay` 下发；承接替换动作 | 不实现匹配算法 |
+| 渲染 | `MarkdownTextView` | 高亮、滚动定位、走标准编辑路径替换 | 不决定「搜什么」 |
+
+内核与状态之间用闭包通信（`onChange` / `onJump`），由 `Workspace` 注入，避免 `SearchController`
+反向持有 `Workspace` 造成循环引用，也让内核可以脱离界面单测。
+
+#### 范围
+
+- **当前文档**：全文查找（不是只查可见区），带 `1/3` 计数、上下跳转、可替换。
+- **所有标签**：跨已打开文件列出结果（文件 → 行号 → 预览片段，点击跳转）。**替换只对当前文档开放**，
+  跨标签替换等于「一次改多个文件」，撤销语义与冲突处理的成本远超收益，明确不做。
+
+#### ADR-19 高亮写渲染属性层，不写 textStorage；替换走 `insertText(_:replacementRange:)`
+
+（第十四轮。编号接 §4.10 的 ADR-18，本条因体量大另立小节。）
+
+三个约束把方案逼到唯一解：
+
+1. **不能写 textStorage**。写进去会①污染撤销栈（用户按 ⌘Z 撤销的不是自己的编辑）、
+   ②触发 `didChangeText` → 回写模型 → 触发自动保存（搜索不该改脏状态）、
+   ③被语法高亮整段覆盖（两套属性反复互相盖，表现为高亮闪一下就没了）。
+   正解是引擎的「临时/渲染属性」层：TextKit 2 用 `NSTextLayoutManager.addRenderingAttribute(.backgroundColor, value:for:)`，
+   TextKit 1 用 `NSLayoutManager.setTemporaryAttributes`。两者都只影响绘制，不进文本、不进撤销栈。
+2. **分流顺序不能反**。必须先问 `textLayoutManager` 再问 `layoutManager`；先访问 `layoutManager`
+   会让 TextKit 2 视图**静默降级**成 TextKit 1（这是 ADR-09 已经付过一次代价的坑）。
+   另外 `NSTextLineFragment.characterRange` 是**元素相对**偏移，不是全文偏移，换算错的表现是
+   「所有命中都显示在第 1 行」而不是崩溃——自检里专门留了 200 行的回归项。
+3. **替换必须走标准编辑路径**。`insertText(_:replacementRange:)` 是 NSTextView 的正规入口，
+   撤销注册、委托通知、选区维护都由它完成。绕过它直接改 textStorage，撤销栈就接不上，
+   「⌘Z 撤不回来」是最难查的那类 bug。批量替换**倒序**执行（偏移大的先改），否则前面的区间会被后面的改动推歪；
+   外面套一层 `undoManager.beginUndoGrouping()` / `endUndoGrouping()`，N 次替换只算 1 步。
+
+**高亮的视觉层级**：当前命中用实色 `.findHighlightColor`，其余压到 35% 透明度。
+像素实测（sRGB）当前处 ≈ 1.00/0.98/0.35，其余 ≈ 1.00/0.99/0.79——屏幕上确实分得开。
+
+**跳转不抢焦点**：`jump(to:)` 只 `setSelectedRange` + `scrollRangeToVisible` + `showFindIndicator`，
+刻意不 `makeFirstResponder`。抢焦点会让用户打完一个字就被踢出输入框。
+另外 `jump` 必须**推迟一个 runloop** 执行：在 `updateNSView`（SwiftUI 布局阶段）里同步调
+`setSelectedRange` 会触发 `textViewDidChangeSelection` → 写 `tab.focusedLine`（`@Published`），
+形成布局循环，实测表现为窗口 `alpha` 卡在 0。
+
+**关掉系统查找栏**：`usesFindBar = false`、`isIncrementalSearchingEnabled = false`。
+系统查找栏的快捷键不可改、也搜不到其他标签；不关掉的话同一条 ⌘F 会同时唤出两套 UI。
+
+#### 快捷键接入
+
+复用既有 `ShortcutAction` 体系（ADR-08）：新增 `find` / `findNext` / `findPrevious` / `replace`
+四个 case，默认 ⌘F、⌘G、⇧⌘G、⌥⌘F，分组 `查找`。设置界面按 `groupOrder` 自动渲染，
+所以只加枚举成员就出现在设置里，不需要改 UI。
+**注意显示顺序是 ⌃⌥⇧⌘**，所以「⌘⌥F」渲染成 `⌥⌘F`——自检最初按书写顺序写期望值，错了两条。
+
+#### 自检怎么证明「高亮真的画出来了」
+
+区间算对了 ≠ 屏幕上有颜色。这是整个功能里唯一「模型全对、用户可能什么都看不见」的地方，
+所以断言必须落到**像素**：把探针 `NSTextView` 离屏渲染成位图，数「偏黄」的像素，
+并按蓝色分量分实色 / 淡色两档。TextKit 2 与显式降级后的 TextKit 1 各跑一遍：
+
+| 状态 | 实色 px | 淡色 px |
+|---|---|---|
+| 未查找 | 0 | 0 |
+| 1 处命中 | 298 | 0 |
+| 3 处命中（当前 = 第 1 处） | 298 | 569 |
+| 清除后 | 0 | 0 |
+
+`298 × 3 = 894 ≈ 298 + 569`，且实色恰好等于「一处」的量——同时证明了三件事：
+每处都画了、当前处与其余处的层级真的分开了、清除是干净的。
+
+#### 本轮踩到的两个坑
+
+1. **`NSRegularExpression` 默认不认多行**：不带 `.anchorsMatchLines` 时 `^` 只匹配整段文本开头，
+   不匹配每一行行首，`^dog` 搜不到第 2 行的 `dog`。自检直接抓到（那条断言当时是 FAIL）。
+2. **`Color.clear.frame(width:)` 会撑高整行**：`Color` 在**两个**轴向上都可扩展，只固定宽度时
+   高度仍然贪婪，替换行的 HStack 被撑到填满可用空间，同行控件垂直居中——表现为替换栏浮在编辑区半空中，
+   还顶出一大块空白。改成 `Spacer().frame(width:)`（只在栈的主轴伸展）。
+   这个错误单看查找栏快照看不出来（那时 host 高度被写死），是**整窗快照**暴露的；
+   现在补了一条固有高度断言（两行 68pt），把「看得见但断言不到」的错兜住。
+
+**通用结论**：凡是「画出来才算数」的能力（高亮、行号、光标、指示器），断言要落到像素或内容数组；
+凡是「布局对不对」的问题，快照必须包含**完整上下文**（整窗），单控件快照会把尺寸错误掩盖掉。
+
 ---
 
 ## 五、SyncCoordinator（分屏实时预览，FR-03）
+
 
 **两个职责**：
 

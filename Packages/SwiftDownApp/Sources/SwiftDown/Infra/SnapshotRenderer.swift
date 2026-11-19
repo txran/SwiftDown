@@ -10,6 +10,18 @@ enum SnapshotRenderer {
 
     @discardableResult
     static func render(_ view: NSView, to path: String, size: NSSize) -> NSSize? {
+        guard let rep = capture(view, size: size) else { return nil }
+        guard let data = rep.representation(using: .png, properties: [:]) else { return nil }
+        try? data.write(to: URL(fileURLWithPath: path))
+        return NSSize(width: rep.pixelsWide, height: rep.pixelsHigh)
+    }
+
+    /// 渲染并留下位图。
+    ///
+    /// 与 `render` 分开的原因是：有些结论只能从像素里读。
+    /// 典型是 TextKit 的匹配高亮——它走的是渲染属性层，不进 textStorage，
+    /// 断言「区间算对了」证明不了「屏幕上画出来了」，必须数像素。
+    static func capture(_ view: NSView, size: NSSize) -> NSBitmapImageRep? {
         let window = NSWindow(contentRect: NSRect(origin: .zero, size: size),
                               styleMask: [.titled],
                               backing: .buffered,
@@ -21,10 +33,8 @@ enum SnapshotRenderer {
 
         guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return nil }
         view.cacheDisplay(in: view.bounds, to: rep)
-        guard let data = rep.representation(using: .png, properties: [:]) else { return nil }
-        try? data.write(to: URL(fileURLWithPath: path))
         window.contentView = nil
-        return NSSize(width: rep.pixelsWide, height: rep.pixelsHigh)
+        return rep
     }
 }
 

@@ -128,6 +128,18 @@ struct AppCommands: Commands {
             }
         }
 
+        CommandMenu("查找") {
+            Button("查找…") { workspace.showFind() }
+                .keyboardShortcut(shortcut(.find))
+            Button("查找下一处") { workspace.findNext() }
+                .keyboardShortcut(shortcut(.findNext))
+            Button("查找上一处") { workspace.findPrevious() }
+                .keyboardShortcut(shortcut(.findPrevious))
+            Divider()
+            Button("查找并替换…") { workspace.showFind(replace: true) }
+                .keyboardShortcut(shortcut(.replace))
+        }
+
         CommandMenu("视图") {
             Button("仅源码") { workspace.setViewMode(.editor) }
                 .keyboardShortcut(shortcut(.viewEditor))
@@ -299,6 +311,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 env.workspace.open(url: URL(fileURLWithPath: target))
             }
         }
+
     }
 
     /// 首帧之后再读会话里的文档。

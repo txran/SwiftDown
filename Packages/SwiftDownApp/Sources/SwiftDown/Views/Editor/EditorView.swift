@@ -68,6 +68,8 @@ struct EditorView: NSViewRepresentable {
         coordinator.scrollView = scrollView
         coordinator.revision = tab.revision
         coordinator.observeScroll()
+        // 查找替换需要走 NSTextView 的标准编辑路径，模型层通过这个桥回调
+        tab.editorBridge = coordinator
 
         if let storage {
             if storage.length <= MarkdownHighlighter.fullScanThreshold {
@@ -129,6 +131,21 @@ struct EditorView: NSViewRepresentable {
             textView.scrollToLine(tab.jumpLine)
         }
 
+        // 查找叠加：高亮当场应用；跳转推到下一轮 runloop。
+        // 跳转会 setSelectedRange → textViewDidChangeSelection → 写 tab.focusedLine，
+        // 而 updateNSView 正处在 SwiftUI 布局期，直接写 @Published 会把布局打回循环
+        // （同 adopt 里那条注释，是同一个坑）。
+        if coordinator.lastSearchOverlayToken != tab.searchOverlay.token {
+            coordinator.lastSearchOverlayToken = tab.searchOverlay.token
+            let overlay = tab.searchOverlay
+            textView.applySearchHighlights(overlay.ranges, current: overlay.current)
+            if let jump = overlay.jump {
+                DispatchQueue.main.async { [weak textView] in
+                    textView?.jump(to: jump)
+                }
+            }
+        }
+
         // 程序化改写
         if coordinator.revision != tab.revision {
             coordinator.revision = tab.revision
@@ -142,13 +159,16 @@ struct EditorView: NSViewRepresentable {
     }
 
     static func dismantleNSView(_ nsView: NSScrollView, coordinator: Coordinator) {
+        if coordinator.tab.editorBridge === coordinator {
+            coordinator.tab.editorBridge = nil
+        }
         coordinator.teardown()
     }
 
     // MARK: - Coordinator
 
     @MainActor
-    final class Coordinator: NSObject, NSTextViewDelegate {
+    final class Coordinator: NSObject, NSTextViewDelegate, EditorBridge {
 
         var parent: EditorView
         var tab: DocumentTab
@@ -158,6 +178,8 @@ struct EditorView: NSViewRepresentable {
 
         var revision: Int = -1
         var lastJumpToken: Int = 0
+        /// 上次应用的查找叠加 token（-1 表示从未应用）
+        var lastSearchOverlayToken: Int = -1
         var theme: EditorTheme
         var fontName: String
         private var highlightWork: DispatchWorkItem?
@@ -233,10 +255,18 @@ struct EditorView: NSViewRepresentable {
         /// 只替换 textStorage 内容，并把瞬态状态（撤销栈、选区、滚动）重置。
         func adopt(_ newTab: DocumentTab) {
             TraceEvents.log("adopt → \(newTab.displayName)")
+            let previous = tab
             tab = newTab
             revision = newTab.revision
             // 跨文档的跳转令牌没有可比性，不同步会让新文档被误判成「要跳转」
             lastJumpToken = newTab.jumpToken
+            // 编辑器桥跟着当前文档走：替换只作用于用户正在看的这份
+            if previous.editorBridge === self, previous.id != newTab.id {
+                previous.editorBridge = nil
+            }
+            newTab.editorBridge = self
+            // 换文档后旧的高亮区间已随 replaceEntireText 失效，强制下一帧重算
+            lastSearchOverlayToken = -1
 
             guard let textView else { return }
 
@@ -384,6 +414,18 @@ struct EditorView: NSViewRepresentable {
                 lastReportedLine = line
                 reportLine(line)
             }
+        }
+
+        // MARK: - EditorBridge（查找替换）
+
+        func replaceSearchMatch(range: NSRange, with text: String) -> Bool {
+            guard let textView else { return false }
+            return textView.replaceMatch(range: range, with: text)
+        }
+
+        func replaceSearchMatches(ranges: [NSRange], with text: String) -> Int {
+            guard let textView else { return 0 }
+            return textView.replaceMatches(ranges: ranges, with: text)
         }
 
         // MARK: 高亮

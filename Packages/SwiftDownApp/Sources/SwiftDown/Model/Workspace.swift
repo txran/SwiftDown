@@ -75,6 +75,10 @@ final class Workspace: ObservableObject {
 
     let settings: AppSettings
 
+    /// 查找栏状态（⌘F / ⌘⌥F）。放在 Workspace 里是因为重算需要访问标签集合，
+    /// 而它自己也只在有活跃文档时有意义。
+    let search = SearchController()
+
     private let store = DiskFileStore()
     private let sessionStore: SessionStore
     private var persistWork: DispatchWorkItem?
@@ -149,6 +153,7 @@ final class Workspace: ObservableObject {
             prepareSessionRestore()
         }
         registerLifecycleObservers()
+        configureSearch()
     }
 
     /// 失焦 / 退出前强制落盘（FR-04 验收：切到其他应用再切回，磁盘内容与编辑器一致）
@@ -311,6 +316,7 @@ final class Workspace: ObservableObject {
         }
         tabs.append(tab)
         activeTabID = tab.id
+        if search.isPresented { refreshSearch() }
         schedulePersist()
     }
 
@@ -353,6 +359,7 @@ final class Workspace: ObservableObject {
         }
         activeTabID = tab.id
         tab.focusedLine = tab.focusedLine  // 触发预览重新对齐
+        if search.isPresented { refreshSearch() }
         schedulePersist()
     }
 
@@ -417,6 +424,8 @@ final class Workspace: ObservableObject {
                 activeTabID = tabs[min(index, tabs.count - 1)].id
             }
         }
+        // 命中表是按标签算的，集合一变就得重算（否则会指向已关闭的文档）
+        if search.isPresented { refreshSearch() }
         schedulePersist()
     }
 
@@ -591,6 +600,132 @@ final class Workspace: ObservableObject {
         )
         sessionStore.save(session)
         settings.userDefaults.set(viewMode.rawValue, forKey: "swiftdown.viewMode")
+    }
+
+    // MARK: - 查找与替换
+
+    private var searchRefreshWork: DispatchWorkItem?
+
+    private func configureSearch() {
+        search.onChange = { [weak self] in self?.scheduleSearchRefresh() }
+        search.onJump = { [weak self] match in self?.jumpToMatch(match) }
+    }
+
+    /// 输入框每变一个字都会走到这里，节流后再真扫。
+    /// 全文扫描是 O(n)（4.8MB 文档实测几十毫秒），逐键同步扫会让输入明显发滞。
+    private func scheduleSearchRefresh() {
+        searchRefreshWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated { self?.refreshSearch() }
+        }
+        searchRefreshWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
+    }
+
+    func showFind(replace: Bool = false) {
+        search.showsReplace = replace
+        search.isPresented = true
+        refreshSearch()
+    }
+
+    func closeFind() {
+        searchRefreshWork?.cancel()
+        search.isPresented = false
+        search.reset()
+        activeTab?.clearSearchOverlay()
+    }
+
+    /// 重算命中并刷新叠加层。同步执行（自检直接调它，不依赖节流）。
+    func refreshSearch() {
+        guard search.isPresented else { return }
+        guard let tab = activeTab else {
+            search.apply(documentMatches: [], tabResults: [], error: nil)
+            return
+        }
+        guard search.hasQuery else {
+            search.apply(documentMatches: [], tabResults: [], error: nil)
+            tab.clearSearchOverlay()
+            return
+        }
+        if let error = FindEngine.validate(query: search.query, options: search.options) {
+            search.apply(documentMatches: [], tabResults: [], error: error)
+            tab.clearSearchOverlay()
+            return
+        }
+
+        let documentMatches = FindEngine.matches(in: tab.text,
+                                                 query: search.query,
+                                                 options: search.options)
+        var results: [TabSearchResult] = []
+        if search.scope == .allTabs {
+            for each in tabs {
+                // 当前标签的结果已经算过，不重复扫
+                let matches = each.id == tab.id
+                    ? documentMatches
+                    : FindEngine.matches(in: each.text, query: search.query, options: search.options)
+                if !matches.isEmpty {
+                    results.append(TabSearchResult(id: each.id,
+                                                   name: each.displayName,
+                                                   path: each.url.path,
+                                                   matches: matches))
+                }
+            }
+        }
+        search.apply(documentMatches: documentMatches, tabResults: results, error: nil)
+        applySearchOverlay(jumpToCurrent: true)
+    }
+
+    private func applySearchOverlay(jumpToCurrent: Bool) {
+        guard let tab = activeTab else { return }
+        tab.applySearchOverlay(ranges: search.documentMatches.map(\.range),
+                               current: search.currentMatch?.range,
+                               jump: jumpToCurrent && search.currentMatch != nil)
+    }
+
+    private func jumpToMatch(_ match: SearchMatch) {
+        guard let tab = activeTab else { return }
+        tab.applySearchOverlay(ranges: search.documentMatches.map(\.range),
+                               current: match.range,
+                               jump: true)
+    }
+
+    /// 「所有标签」结果列表点击：先切到那个标签，再跳到这一处
+    func jumpToResult(tabID: UUID, match: SearchMatch) {
+        guard let tab = tabs.first(where: { $0.id == tabID }) else { return }
+        if tab.id != activeTabID { activate(tab) }
+        refreshSearch()
+        tab.applySearchOverlay(ranges: search.documentMatches.map(\.range),
+                               current: match.range,
+                               jump: true)
+    }
+
+    func findNext() {
+        guard search.isPresented else { showFind(); return }
+        search.next()
+    }
+
+    func findPrevious() {
+        guard search.isPresented else { showFind(); return }
+        search.previous()
+    }
+
+    func replaceCurrentMatch() {
+        guard search.isPresented, search.scope == .document,
+              let tab = activeTab, let match = search.currentMatch else { return }
+        guard tab.canEdit else { return }
+        if tab.replaceText(in: match.range, with: search.replacement) {
+            // 替换后命中表已变化：重算，游标停在原位置就正好是「下一处」
+            refreshSearch()
+        }
+    }
+
+    func replaceAllMatches() {
+        guard search.isPresented, search.scope == .document, let tab = activeTab else { return }
+        let ranges = search.documentMatches.map(\.range)
+        guard !ranges.isEmpty, tab.canEdit else { return }
+        if tab.replaceAllText(in: ranges, with: search.replacement) > 0 {
+            refreshSearch()
+        }
     }
 
     // MARK: - 视图模式

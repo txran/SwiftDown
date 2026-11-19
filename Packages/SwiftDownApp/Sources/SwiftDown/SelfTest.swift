@@ -1,6 +1,7 @@
 import AppKit
 import CoreGraphics
 import Foundation
+import SwiftDownCore
 import SwiftUI
 
 /// 无头自检（`SwiftDown --selftest <file>`）。
@@ -574,6 +575,306 @@ enum SelfTest {
               wrapHeight > TabBarMetrics.rowHeight && wrapHeight <= TabBarMetrics.maxWrapHeight + 0.5,
               String(format: "%.1f / 上限 %.0f", wrapHeight, TabBarMetrics.maxWrapHeight))
 
+        // 9.6 查找与替换（SR，用户追加需求，⌘F / ⌘⌥F）
+        //
+        // 编号记作 SR 而不是 FR-xx：PRD 里的 FR-10 是「导出 HTML / PDF」，
+        // 查找替换是需求方后来直接提的，不在 PRD 需求表内，复用 FR-10 会让两边串号。
+        //
+        // 分三层验：内核（纯函数，边界最密）→ 模型（命中表/替换/冻结）→ 编辑器（倒序批替换）。
+        // 只断言「能搜到」没有意义：偏移口径、行号、整词边界、上限这些最容易错的地方，
+        // 表现恰恰是「能搜到但结果错」，必须对具体数字。
+
+        // 9.6.1 内核：大小写 / 整词 / 行号
+        let findSample = "cat cats CAT\ndog cat"
+        let insensitive = FindEngine.matches(in: findSample, query: "cat", options: SearchOptions())
+        check("SR 默认不区分大小写命中 4 处", insensitive.count == 4, "count=\(insensitive.count)")
+
+        var caseOptions = SearchOptions()
+        caseOptions.caseSensitive = true
+        let caseSensitive = FindEngine.matches(in: findSample, query: "cat", options: caseOptions)
+        check("SR 区分大小写后 3 处（排除 CAT）", caseSensitive.count == 3, "count=\(caseSensitive.count)")
+
+        var wordOptions = SearchOptions()
+        wordOptions.wholeWord = true
+        let wholeWord = FindEngine.matches(in: findSample, query: "cat", options: wordOptions)
+        check("SR 整词匹配排除 cats", wholeWord.count == 3, "count=\(wholeWord.count)")
+        check("SR 行号口径正确（末处在第 2 行）",
+              insensitive.last?.line == 2, "line=\(insensitive.last?.line ?? -1)")
+
+        // 9.6.2 内核：长偏移必须落到正确行（回归：曾把元素相对偏移当全文偏移，
+        // 表现是「全是第 1 行」而不是崩溃）
+        let manyLines = (1...200).map { "第 \($0) 行 cat" }.joined(separator: "\n")
+        let lastMatch = FindEngine.matches(in: manyLines, query: "cat", options: SearchOptions()).last
+        check("SR 第 200 行的命中算出 200", lastMatch?.line == 200, "line=\(lastMatch?.line ?? -1)")
+
+        // 9.6.3 内核：正则 / 非法正则 / 零长匹配 / 上限
+        var regexOptions = SearchOptions()
+        regexOptions.regex = true
+        let regexHits = FindEngine.matches(in: findSample, query: "^dog", options: regexOptions)
+        check("SR 正则命中第 2 行行首 1 处", regexHits.count == 1 && regexHits.first?.line == 2,
+              "count=\(regexHits.count)")
+        check("SR 非法正则被判为错误而不是崩溃",
+              FindEngine.validate(query: "[", options: regexOptions) != nil)
+        check("SR 非法正则不产生命中",
+              FindEngine.matches(in: findSample, query: "[", options: regexOptions).isEmpty)
+        check("SR 零长匹配被忽略（避免替换陷入不动点）",
+              FindEngine.matches(in: findSample, query: "^", options: regexOptions).isEmpty)
+        let manyHits = String(repeating: "a ", count: 800)
+        check("SR 命中数被上限截断",
+              FindEngine.matches(in: manyHits, query: "a", options: SearchOptions()).count
+                == FindEngine.maxMatchesPerTab,
+              "limit=\(FindEngine.maxMatchesPerTab)")
+        check("SR 空查询返回空结果",
+              FindEngine.matches(in: findSample, query: "", options: SearchOptions()).isEmpty)
+
+        // 9.6.4 模型：查找栏状态、命中表、范围切换
+        let findWorkspace = Workspace(settings: settings, restoreSessionOnInit: false)
+        let findFileA = tempDirectory.appendingPathComponent("find-a.md")
+        let findFileB = tempDirectory.appendingPathComponent("find-b.md")
+        try? "# 甲\n\nalpha beta alpha\n\ngamma alpha\n".write(to: findFileA, atomically: true, encoding: .utf8)
+        try? "# 乙\n\nalpha alpha\n".write(to: findFileB, atomically: true, encoding: .utf8)
+        findWorkspace.open(urls: [findFileA, findFileB])
+        try? await Task.sleep(nanoseconds: 900_000_000)
+        check("SR 查找用双标签就绪", findWorkspace.tabs.count == 2, "tabs=\(findWorkspace.tabs.count)")
+
+        if let firstTab = findWorkspace.tabs.first {
+            findWorkspace.activate(firstTab)
+        }
+        findWorkspace.showFind()
+        check("SR 查找栏可展开", findWorkspace.search.isPresented)
+
+        findWorkspace.search.query = "alpha"
+        findWorkspace.refreshSearch()   // 同步重算，不等 120ms 节流
+        let docMatches = findWorkspace.search.documentMatches
+        check("SR 当前文档命中 3 处", docMatches.count == 3, "count=\(docMatches.count)")
+        check("SR 命中行号为 [3,3,5]", docMatches.map(\.line) == [3, 3, 5],
+              "\(docMatches.map(\.line))")
+        check("SR 叠加层拿到全部命中区间",
+              findWorkspace.activeTab?.searchOverlay.ranges.count == 3,
+              "ranges=\(findWorkspace.activeTab?.searchOverlay.ranges.count ?? -1)")
+        check("SR 当前命中落在第一处",
+              findWorkspace.activeTab?.searchOverlay.current == docMatches.first?.range)
+
+        // 9.6.4.1 视觉回归：查找栏是最容易「功能对、排版错」的一类界面，
+        // 用它自己的真实状态渲染两帧，人工核对一次（纯 SwiftUI 单独托管，不依赖主窗口）。
+        // 必须显式设置 host.frame：只给 SwiftUI 根视图 .frame() 时，NSHostingView 自身
+        // 仍是零尺寸，layout 会按一个极窄的宽度算，快照里控件全被压扁（实测过一次）。
+        findWorkspace.search.showsReplace = true
+        findWorkspace.search.replacement = "ZZZ"
+        let findBarHost = NSHostingView(rootView: FindBar(search: findWorkspace.search)
+            .environmentObject(findWorkspace)
+            .environmentObject(settings))
+        findBarHost.frame = NSRect(x: 0, y: 0, width: 1180, height: 66)
+        findBarHost.layoutSubtreeIfNeeded()
+        snapshotView(findBarHost, to: "/tmp/swiftdown-findbar-replace.png",
+                     size: NSSize(width: 1180, height: 66))
+
+        findWorkspace.search.scope = .allTabs
+        findWorkspace.refreshSearch()
+        let findBarGlobalHost = NSHostingView(rootView: FindBar(search: findWorkspace.search)
+            .environmentObject(findWorkspace)
+            .environmentObject(settings))
+        findBarGlobalHost.frame = NSRect(x: 0, y: 0, width: 1180, height: 210)
+        findBarGlobalHost.layoutSubtreeIfNeeded()
+        snapshotView(findBarGlobalHost, to: "/tmp/swiftdown-findbar-global.png",
+                     size: NSSize(width: 1180, height: 210))
+        findWorkspace.search.showsReplace = false
+
+        // 9.6.4.2 布局回归：查找栏的固有高度必须紧凑。
+        // 踩过一次：替换行用 `Color.clear.frame(width:)` 做左侧占位，Color 两个轴都贪婪，
+        // 宽度定住了、高度没定，整行被撑到填满可用空间，同行控件被垂直居中，
+        // 结果替换栏浮在编辑区半空中、还顶出一大块空白（整窗快照里才看出来）。
+        // 这类「看得见但断言不到」的错，用固有高度兜住。
+        findWorkspace.search.scope = .document
+        findWorkspace.search.showsReplace = true
+        findWorkspace.refreshSearch()
+        let intrinsicHost = NSHostingView(rootView: FindBar(search: findWorkspace.search)
+            .environmentObject(findWorkspace)
+            .environmentObject(settings))
+        intrinsicHost.layoutSubtreeIfNeeded()
+        let twoRowHeight = intrinsicHost.fittingSize.height
+        check("SR 查找栏两行（查找 + 替换）高度紧凑",
+              twoRowHeight > 40 && twoRowHeight < 100, "\(Int(twoRowHeight))pt")
+        findWorkspace.search.showsReplace = false
+
+        // 9.6.4.3 视觉回归：整窗快照（编辑器 + 查找栏 + 真实高亮）。
+        // 单渲查找栏只能证明「控件排对了」，证明不了它压在编辑器上方是不是这个观感，
+        // 也证明不了命中高亮在正文里跟排版合不合。整窗渲一张，一次看全。
+        // 走离屏渲染而不是真实截图：真机截图要么撞窗口遮挡，要么要辅助功能权限去敲 ⌘F。
+        findWorkspace.search.scope = .document
+        findWorkspace.search.showsReplace = true
+        findWorkspace.refreshSearch()
+        let composeHost = NSHostingView(rootView: RootView()
+            .environmentObject(settings)
+            .environmentObject(findWorkspace)
+            .preferredColorScheme(settings.themeMode.colorScheme))
+        composeHost.frame = NSRect(x: 0, y: 0, width: 1180, height: 760)
+        composeHost.layoutSubtreeIfNeeded()
+        snapshotView(composeHost, to: "/tmp/swiftdown-find-window.png",
+                     size: NSSize(width: 1180, height: 760))
+        findWorkspace.search.showsReplace = false
+
+        findWorkspace.search.scope = .allTabs
+        findWorkspace.refreshSearch()
+        check("SR 所有标签范围覆盖 2 个文件",
+              findWorkspace.search.tabResults.count == 2,
+              "files=\(findWorkspace.search.tabResults.count)")
+        check("SR 跨文件命中合计 5 处",
+              findWorkspace.search.totalAllTabs == 5, "total=\(findWorkspace.search.totalAllTabs)")
+        findWorkspace.search.scope = .document
+        findWorkspace.refreshSearch()
+
+        // 9.6.5 模型：替换单处 / 全部替换 / 撤销隔离
+        // 替换词刻意用 "ZZZ" 而不是 "ALPHA"：默认查找不区分大小写，
+        // 用 "ALPHA" 替换后「无残留」会通过，但「命中清零」必然是 3 处（自己判自己）。
+        findWorkspace.search.replacement = "ZZZ"
+        findWorkspace.replaceCurrentMatch()
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        let textAfterOne = findWorkspace.activeTab?.text ?? ""
+        check("SR 替换单处后旧词少一处",
+              textAfterOne == "# 甲\n\nZZZ beta alpha\n\ngamma alpha\n", textAfterOne)
+
+        findWorkspace.replaceAllMatches()
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        let textAfterAll = findWorkspace.activeTab?.text ?? ""
+        check("SR 全部替换后无残留", !textAfterAll.contains("alpha"), textAfterAll)
+        check("SR 全部替换后命中清零",
+              findWorkspace.search.documentMatches.isEmpty,
+              "count=\(findWorkspace.search.documentMatches.count)")
+        check("SR 替换后进入未保存态", isDirty(findWorkspace.activeTab!), stateLabel(findWorkspace.activeTab!))
+
+        // 9.6.6 模型：只读/占位标签拒绝替换（冻结语义不能只在按钮上做）
+        let orphanURL = tempDirectory.appendingPathComponent("missing.md")
+        let orphanSession = DocumentSession.placeholder(url: orphanURL, reason: "文件不存在")
+        let orphanTab = DocumentTab(session: orphanSession, settings: settings, isReadOnly: true)
+        check("SR 占位标签不可编辑", !orphanTab.canEdit)
+        check("SR 占位标签拒绝替换",
+              !orphanTab.replaceText(in: NSRange(location: 0, length: 0), with: "x"))
+
+        findWorkspace.closeFind()
+        check("SR 关闭查找栏后叠加层清空",
+              findWorkspace.activeTab?.searchOverlay.ranges.isEmpty ?? false)
+        check("SR 关闭查找栏后查询被重置",
+              findWorkspace.search.query.isEmpty && !findWorkspace.search.isPresented)
+
+        // 9.6.7 编辑器：批量替换必须倒序，且只产生一次模型回写
+        let replaceProbe = MarkdownTextView(frame: NSRect(x: 0, y: 0, width: 420, height: 260))
+        replaceProbe.string = "alpha beta alpha"
+        let replaceCount = replaceProbe.replaceMatches(
+            ranges: [NSRange(location: 0, length: 5), NSRange(location: 11, length: 5)],
+            with: "X"
+        )
+        check("SR 编辑器批量替换倒序正确", replaceCount == 2 && replaceProbe.string == "X beta X",
+              replaceProbe.string)
+        replaceProbe.string = "alpha"
+        check("SR 编辑器单处替换生效",
+              replaceProbe.replaceMatch(range: NSRange(location: 0, length: 5), with: "Y")
+                && replaceProbe.string == "Y", replaceProbe.string)
+
+        // 9.6.7.1 编辑器：高亮必须真的「画」出来（像素级，TextKit 2 / 1 各验一遍）
+        //
+        // 整个查找功能里唯一一处「模型全对、用户却可能什么都看不见」的地方：
+        // 高亮走的是渲染属性 / 临时属性，刻意不进 textStorage，
+        // 所以前面所有断言（区间、token、数量）都不等于屏幕上有颜色。
+        // 唯一可信的判据是把视图渲成位图数黄色像素；顺带确认降级到 TextKit 1 后仍然成立。
+        for engine in ["TextKit 2", "TextKit 1"] {
+            let probe = MarkdownTextView(frame: NSRect(x: 0, y: 0, width: 420, height: 180))
+            probe.appearance = NSAppearance(named: .aqua)   // 固定浅色：深色外观下这条判据不成立
+            probe.string = "alpha beta alpha gamma alpha"
+            if engine == "TextKit 1" {
+                _ = probe.layoutManager    // 访问即降级，此处是有意为之，用来验证兼容分支
+            }
+            let actual = probe.textLayoutManager != nil ? "TextKit 2" : "TextKit 1"
+            check("SR 高亮探针确实跑在 \(engine) 上", actual == engine, actual)
+
+            let size = NSSize(width: 420, height: 180)
+            func yellow() -> (strong: Int, faint: Int) {
+                probe.layoutSubtreeIfNeeded()
+                guard let rep = SnapshotRenderer.capture(probe, size: size) else { return (-1, -1) }
+                return yellowPixels(rep)
+            }
+
+            let blank = yellow()
+            let one = [NSRange(location: 0, length: 5)]
+            probe.applySearchHighlights(one, current: one[0])
+            let onePainted = yellow()
+
+            let three = [NSRange(location: 0, length: 5),
+                         NSRange(location: 11, length: 5),
+                         NSRange(location: 23, length: 5)]
+            probe.applySearchHighlights(three, current: three[0])
+            let threePainted = yellow()
+            if engine == "TextKit 2", let rep = SnapshotRenderer.capture(probe, size: size),
+               let data = rep.representation(using: .png, properties: [:]) {
+                try? data.write(to: URL(fileURLWithPath: "/tmp/swiftdown-find-highlight.png"))
+            }
+
+            probe.clearSearchHighlights()
+            let clearedPainted = yellow()
+
+            check("SR \(engine) 未查找时无高亮底色",
+                  blank.strong + blank.faint < 80, "\(blank.strong + blank.faint) px")
+            check("SR \(engine) 查找后画出高亮底色", onePainted.strong > 200,
+                  "\(onePainted.strong) px（实色）")
+            check("SR \(engine) 唯一命中全用实色，没有多余淡色", onePainted.faint < 60,
+                  "淡色 \(onePainted.faint) px")
+            // 「我在哪一处」必须看得出：一处实色 + 两处淡色，像素上要真的分得开
+            check("SR \(engine) 三处命中逐处都画（不是只画第一处）",
+                  threePainted.strong + threePainted.faint > onePainted.strong + 400,
+                  "一处 \(onePainted.strong) → 三处 \(threePainted.strong + threePainted.faint) px")
+            check("SR \(engine) 当前命中实色、其余淡色，层级分明",
+                  threePainted.strong > 200 && threePainted.faint > threePainted.strong * 3 / 2,
+                  "实色 \(threePainted.strong) / 淡色 \(threePainted.faint) px")
+            check("SR \(engine) 清除高亮后底色退干净",
+                  clearedPainted.strong + clearedPainted.faint <= blank.strong + blank.faint + 80,
+                  "\(clearedPainted.strong + clearedPainted.faint) px（基线 \(blank.strong + blank.faint)）")
+        }
+
+        // 9.6.8 快捷键：默认无冲突 + 可在设置里改
+        let defaultSignatures = ShortcutAction.allCases.map { $0.defaultBinding.signature }
+        check("快捷键默认组合无重复",
+              Set(defaultSignatures).count == defaultSignatures.count,
+              "\(defaultSignatures.count) 项")
+        check("查找默认绑定为 ⌘F", ShortcutAction.find.defaultBinding.displayString == "⌘F",
+              ShortcutAction.find.defaultBinding.displayString)
+        check("替换默认绑定为 ⌥⌘F", ShortcutAction.replace.defaultBinding.displayString == "⌥⌘F",
+              ShortcutAction.replace.defaultBinding.displayString)
+        check("查找动作进入设置分组",
+              ShortcutAction.groupOrder.contains(ShortcutAction.find.group))
+        settings.setBinding(ShortcutBinding(key: "j", modifiers: [.command, .shift]), for: .find)
+        check("查找快捷键可在设置中修改",
+              settings.binding(for: .find).displayString == "⇧⌘J",
+              settings.binding(for: .find).displayString)
+        settings.resetBinding(for: .find)
+        check("查找快捷键可恢复默认",
+              settings.binding(for: .find).signature == ShortcutAction.find.defaultBinding.signature)
+
+        // 9.6.9 菜单：⌘F 只能有一项（系统自带 Find 与自定义菜单重复时，
+        // 按下的可能不是我们这条，表现为「快捷键没反应」）
+        var commandFItems: [String] = []
+        var keyEquivalentDump: [String] = []
+        func walkMenu(_ menu: NSMenu) {
+            for item in menu.items {
+                let key = item.keyEquivalent
+                if !key.isEmpty {
+                    let flags = item.keyEquivalentModifierMask
+                    let onlyCommand = flags.contains(.command)
+                        && !flags.contains(.shift)
+                        && !flags.contains(.option)
+                        && !flags.contains(.control)
+                    let label = "\(menu.title) ▸ \(item.title)"
+                    keyEquivalentDump.append("\(label) = \(key)")
+                    if key.lowercased() == "f", onlyCommand { commandFItems.append(label) }
+                }
+                if let submenu = item.submenu { walkMenu(submenu) }
+            }
+        }
+        if let mainMenu = NSApp.mainMenu { walkMenu(mainMenu) }
+        check("SR 菜单里 ⌘F 只有一项", commandFItems.count == 1, "\(commandFItems)")
+        if commandFItems.count != 1 {
+            for line in keyEquivalentDump { print("[menu] \(line)") }
+        }
+
         // 临目录清理交给 defer（中途 return 也会执行）
         // 清掉自检写入的专用设置域与会话目录。
         // 注意：以前这里删的是用户真实的 `Application Support/SwiftDown/session.json`——
@@ -602,6 +903,29 @@ enum SelfTest {
         if let pixels = SnapshotRenderer.render(view, to: path, size: size) {
             print("[snapshot] \(path) \(Int(pixels.width))x\(Int(pixels.height))")
         }
+    }
+
+    /// 数「偏黄」的像素，并按饱和度分两档，把「高亮画出来了没有」变成可断言的事实。
+    ///
+    /// 判据故意不用精确色值：当前命中是实色 `findHighlightColor`（实测 sRGB ≈ 1.00/0.98/0.35），
+    /// 其余命中压到 35% 透明度后叠在白底上被冲淡（≈ 1.00/0.99/0.79），两者绝对值差得远，
+    /// 但都满足「红绿高、蓝明显低」。白底 r−b≈0 落选，深色文字 r 不到 0.85 也落选。
+    /// 分档看蓝分量：0.35 与 0.79 之间取 0.55 作界。
+    /// 隔行隔列取样：这里要的是量级判断，全量 `colorAt` 在 2x 位图上慢得没有意义。
+    @MainActor
+    private static func yellowPixels(_ rep: NSBitmapImageRep) -> (strong: Int, faint: Int) {
+        var strong = 0
+        var faint = 0
+        for y in stride(from: 0, to: rep.pixelsHigh, by: 2) {
+            for x in stride(from: 0, to: rep.pixelsWide, by: 2) {
+                guard let color = rep.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { continue }
+                guard color.redComponent > 0.85,
+                      color.greenComponent > 0.80,
+                      color.redComponent - color.blueComponent > 0.10 else { continue }
+                if color.blueComponent < 0.55 { strong += 1 } else { faint += 1 }
+            }
+        }
+        return (strong, faint)
     }
 
     @MainActor

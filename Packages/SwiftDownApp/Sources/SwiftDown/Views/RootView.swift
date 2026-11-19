@@ -69,6 +69,8 @@ struct RootView: View {
         if let tab = workspace.activeTab {
             VStack(spacing: 0) {
                 DocumentBanner(tab: tab)
+                // 查找栏横跨编辑区与预览区：在「仅预览」模式下也要能搜
+                FindBarHost(search: workspace.search)
                 HStack(spacing: 0) {
                     if workspace.viewMode != .preview {
                         // 注意：这里**不能**加 `.id(tab.id)`。

@@ -12,6 +12,14 @@ final class MarkdownTextView: NSTextView {
     /// 程序化写入时置位，避免把「我自己改的」当成用户编辑
     private var isApplyingProgrammaticChange = false
 
+    /// 批量编辑深度：全部替换时逐处调用 `insertText`，中间不逐次回写模型
+    /// （500 处 × 每次全量同步 = 500 次字符串拷贝 + 500 次落盘调度）。
+    private var batchDepth = 0
+
+    /// 已应用的查找高亮，用于下次清除。两个引擎分开记，互不干扰。
+    private var appliedSearchRangesTK2: [NSTextRange] = []
+    private var appliedSearchRangesTK1: [NSRange] = []
+
     // MARK: - 行索引
     //
     // 滚动同步与行号标尺每秒要问几十次「这个偏移是第几行」。
@@ -113,8 +121,11 @@ final class MarkdownTextView: NSTextView {
         isAutomaticSpellingCorrectionEnabled = false
         isContinuousSpellCheckingEnabled = false
         isGrammarCheckingEnabled = false
-        usesFindBar = true
-        isIncrementalSearchingEnabled = true
+        // 不用系统查找栏：它的快捷键不可改，也搜不到其他标签。
+        // 应用自己实现查找栏（⌘F / ⌘⌥F，见 FindBar），这里必须关掉，
+        // 否则同一条 ⌘F 会同时唤出两套 UI。
+        usesFindBar = false
+        isIncrementalSearchingEnabled = false
         drawsBackground = true
         backgroundColor = .textBackgroundColor
         textContainerInset = NSSize(width: 14, height: 14)
@@ -133,13 +144,29 @@ final class MarkdownTextView: NSTextView {
     override func didChangeText() {
         super.didChangeText()
         lineIndexDirty = true
-        guard !isApplyingProgrammaticChange else { return }
+        guard !isApplyingProgrammaticChange, batchDepth == 0 else { return }
+        onTextChange?(string)
+        reportCurrentLine()
+    }
+
+    /// 批量编辑开始：期间不逐次回写模型，结束时统一通知一次
+    func beginBatchEdit() {
+        batchDepth += 1
+    }
+
+    func endBatchEdit() {
+        guard batchDepth > 0 else { return }
+        batchDepth -= 1
+        guard batchDepth == 0 else { return }
+        lineIndexDirty = true
         onTextChange?(string)
         reportCurrentLine()
     }
 
     /// 整体替换（重载 / 冲突采用磁盘版 / 会话恢复）
     func replaceEntireText(with newText: String, theme: EditorTheme) {
+        // 整体换文本后旧的命中区间全部失效，先撤掉高亮再写内容
+        clearSearchHighlights()
         isApplyingProgrammaticChange = true
         let selection = selectedRange()
         let attributed = NSAttributedString(string: newText, attributes: theme.baseAttributes)
@@ -149,6 +176,110 @@ final class MarkdownTextView: NSTextView {
         isApplyingProgrammaticChange = false
         lineIndexDirty = true
         needsDisplay = true
+    }
+
+    // MARK: - 查找高亮与跳转
+
+    /// 把当前命中滚到可见位置并选中。
+    ///
+    /// 不调 `makeFirstResponder`：查找时焦点还在输入框里，抢焦点会让用户
+    /// 打完一个字就被踢出输入框。用系统查找指示器（`showFindIndicator`）
+    /// 代替焦点，视觉上同样明确。
+    func jump(to range: NSRange) {
+        let length = (string as NSString).length
+        guard range.location >= 0, range.location <= length else { return }
+        let safe = NSRange(location: range.location,
+                           length: min(range.length, length - range.location))
+        setSelectedRange(safe)
+        scrollRangeToVisible(safe)
+        showFindIndicator(for: safe)
+    }
+
+    /// 全部命中的临时高亮。
+    ///
+    /// 刻意**不**写进 textStorage：那会污染撤销栈、触发 `didChangeText`，
+    /// 还会被语法高亮整段覆盖。改用引擎的「临时/渲染属性」层：
+    /// - TextKit 2：`NSTextLayoutManager.addRenderingAttribute`
+    /// - TextKit 1：`NSLayoutManager.setTemporaryAttributes`
+    ///
+    /// 分流必须先问 `textLayoutManager`（判断顺序见设计文档：先 TK2 后 TK1），
+    /// 反了会把这个视图静默降级成 TextKit 1。
+    func applySearchHighlights(_ ranges: [NSRange], current: NSRange?) {
+        clearSearchHighlights()
+        let length = (string as NSString).length
+        let valid = ranges.filter {
+            $0.length > 0 && $0.location >= 0 && $0.location + $0.length <= length
+        }
+        guard !valid.isEmpty else { return }
+
+        if let layoutManager2 = textLayoutManager {
+            guard let content = layoutManager2.textContentManager else { return }
+            let origin = content.documentRange.location
+            for range in valid {
+                let color = highlightColor(for: range, current: current)
+                guard let start = content.location(origin, offsetBy: range.location),
+                      let end = content.location(start, offsetBy: range.length),
+                      let textRange = NSTextRange(location: start, end: end) else { continue }
+                layoutManager2.addRenderingAttribute(.backgroundColor, value: color, for: textRange)
+                appliedSearchRangesTK2.append(textRange)
+            }
+        } else if let layoutManager1 = layoutManager {
+            for range in valid {
+                let color = highlightColor(for: range, current: current)
+                layoutManager1.setTemporaryAttributes([.backgroundColor: color],
+                                                     forCharacterRange: range)
+                appliedSearchRangesTK1.append(range)
+            }
+        }
+    }
+
+    func clearSearchHighlights() {
+        if let layoutManager2 = textLayoutManager {
+            for range in appliedSearchRangesTK2 {
+                layoutManager2.removeRenderingAttribute(.backgroundColor, for: range)
+            }
+        } else if let layoutManager1 = layoutManager {
+            for range in appliedSearchRangesTK1 {
+                layoutManager1.removeTemporaryAttribute(.backgroundColor, forCharacterRange: range)
+            }
+        }
+        appliedSearchRangesTK2.removeAll(keepingCapacity: true)
+        appliedSearchRangesTK1.removeAll(keepingCapacity: true)
+    }
+
+    private func highlightColor(for range: NSRange, current: NSRange?) -> NSColor {
+        // 当前命中用实色，其余压到 35%：一眼能分出「我现在在哪一处」
+        range == current ? .findHighlightColor : NSColor.findHighlightColor.withAlphaComponent(0.35)
+    }
+
+    // MARK: - 替换（走标准编辑路径，撤销可回）
+
+    /// 替换单处。`insertText(_:replacementRange:)` 是 NSTextView 的标准编辑入口：
+    /// 撤销注册、委托通知、选区维护都由它完成。
+    func replaceMatch(range: NSRange, with text: String) -> Bool {
+        let length = (string as NSString).length
+        guard range.location >= 0, range.location + range.length <= length else { return false }
+        insertText(text, replacementRange: range)
+        return true
+    }
+
+    /// 全部替换：倒序逐处替换，所有改动合成**一个**撤销步骤。
+    func replaceMatches(ranges: [NSRange], with text: String) -> Int {
+        let length = (string as NSString).length
+        let valid = ranges
+            .filter { $0.location >= 0 && $0.location + $0.length <= length }
+            .sorted { $0.location > $1.location }
+        guard !valid.isEmpty else { return 0 }
+
+        let undo = undoManager
+        undo?.beginUndoGrouping()
+        beginBatchEdit()
+        for range in valid {
+            insertText(text, replacementRange: range)
+        }
+        endBatchEdit()
+        undo?.endUndoGrouping()
+        return valid.count
     }
 
     // MARK: - 语法辅助

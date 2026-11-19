@@ -92,6 +92,11 @@ enum ShortcutAction: String, CaseIterable, Identifiable, Sendable {
     case closeAllTabs
     case nextTab
     case previousTab
+    // 查找
+    case find
+    case findNext
+    case findPrevious
+    case replace
     // 视图
     case viewEditor
     case viewSplit
@@ -113,6 +118,10 @@ enum ShortcutAction: String, CaseIterable, Identifiable, Sendable {
         case .closeAllTabs: return "关闭全部标签"
         case .nextTab: return "下一个标签"
         case .previousTab: return "上一个标签"
+        case .find: return "查找"
+        case .findNext: return "查找下一处"
+        case .findPrevious: return "查找上一处"
+        case .replace: return "查找并替换"
         case .viewEditor: return "仅源码"
         case .viewSplit: return "分屏"
         case .viewPreview: return "仅预览"
@@ -127,6 +136,7 @@ enum ShortcutAction: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .openFile, .saveFile, .saveAllFiles: return "文件"
         case .closeTab, .closeAllTabs, .nextTab, .previousTab: return "标签"
+        case .find, .findNext, .findPrevious, .replace: return "查找"
         case .viewEditor, .viewSplit, .viewPreview, .toggleOutline,
              .toggleLineNumbers, .increaseFont, .decreaseFont: return "视图"
         }
@@ -141,6 +151,10 @@ enum ShortcutAction: String, CaseIterable, Identifiable, Sendable {
         case .closeAllTabs: return ShortcutBinding(key: "w", modifiers: [.command, .shift])
         case .nextTab: return ShortcutBinding(key: "]", modifiers: [.command, .shift])
         case .previousTab: return ShortcutBinding(key: "[", modifiers: [.command, .shift])
+        case .find: return ShortcutBinding(key: "f", modifiers: [.command])
+        case .findNext: return ShortcutBinding(key: "g", modifiers: [.command])
+        case .findPrevious: return ShortcutBinding(key: "g", modifiers: [.command, .shift])
+        case .replace: return ShortcutBinding(key: "f", modifiers: [.command, .option])
         case .viewEditor: return ShortcutBinding(key: "1", modifiers: [.command])
         case .viewSplit: return ShortcutBinding(key: "1", modifiers: [.command, .shift])
         case .viewPreview: return ShortcutBinding(key: "2", modifiers: [.command])
@@ -152,5 +166,5 @@ enum ShortcutAction: String, CaseIterable, Identifiable, Sendable {
     }
 
     /// 分组顺序（设置页按此渲染）
-    static let groupOrder = ["文件", "标签", "视图"]
+    static let groupOrder = ["文件", "标签", "查找", "视图"]
 }

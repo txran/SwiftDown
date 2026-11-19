@@ -2,6 +2,29 @@ import Foundation
 import SwiftDownCore
 import SwiftDownPipeline
 
+/// 查找栏叠加在编辑器上的状态：全部命中高亮 + 当前命中跳转。
+struct SearchOverlay: Equatable {
+    var ranges: [NSRange] = []
+    var current: NSRange?
+    /// 需要滚动到该处时才非空（上下切换命中 / 新查询落在第一处）
+    var jump: NSRange?
+    /// 每次应用自增：同样的区间重复应用也必须让编辑器重画
+    var token: Int = 0
+
+    static let none = SearchOverlay()
+}
+
+/// 编辑器桥：查找替换必须走 `NSTextView` 的标准编辑路径。
+///
+/// 为什么不让模型层直接改字符串再让编辑器整体重载：`insertText(_:replacementRange:)`
+/// 会顺带完成撤销注册、委托通知、选区维护。绕过它自己改 model，用户按 ⌘Z 撤不回来，
+/// 滚动位置也会被重载冲掉。
+@MainActor
+protocol EditorBridge: AnyObject {
+    func replaceSearchMatch(range: NSRange, with text: String) -> Bool
+    func replaceSearchMatches(ranges: [NSRange], with text: String) -> Int
+}
+
 /// 单个文档标签的视图模型：DocumentSession 的 ObservableObject 包装 + 解析管线。
 ///
 /// 职责边界：
@@ -41,6 +64,13 @@ final class DocumentTab: ObservableObject, Identifiable {
 
     /// 预览已对齐的锚点行（避免同一标题反复滚动造成抖动）
     var lastAlignedAnchorLine: Int = -1
+
+    /// 查找栏叠加状态。编辑器在 updateNSView 里按 `token` 变化应用，
+    /// 不通过参数透传，避免把查找状态塞进 EditorView 的初始化签名。
+    @Published private(set) var searchOverlay = SearchOverlay.none
+
+    /// 编辑器桥：EditorView 挂载时注入；仅预览模式下为 nil（替换退化为改模型）
+    weak var editorBridge: EditorBridge?
 
     private var watcher: FileWatcher?
     private var parseGeneration = 0
@@ -283,6 +313,61 @@ final class DocumentTab: ObservableObject, Identifiable {
         case .clean, .dirty: return true
         case .conflict, .missing, .placeholder: return false
         }
+    }
+
+    // MARK: - 查找替换
+
+    /// 当前是否允许改动正文（只读大文件 / 冲突 / 失联 / 占位 都拒绝）
+    var canEdit: Bool { !isReadOnly && session.isEditable }
+
+    func applySearchOverlay(ranges: [NSRange], current: NSRange?, jump: Bool) {
+        var overlay = SearchOverlay()
+        overlay.ranges = ranges
+        overlay.current = current
+        overlay.jump = jump ? current : nil
+        overlay.token = searchOverlay.token &+ 1
+        searchOverlay = overlay
+    }
+
+    func clearSearchOverlay() {
+        guard !searchOverlay.ranges.isEmpty
+                || searchOverlay.current != nil
+                || searchOverlay.jump != nil else { return }
+        var overlay = SearchOverlay.none
+        overlay.token = searchOverlay.token &+ 1
+        searchOverlay = overlay
+    }
+
+    /// 替换单处。有编辑器时走标准编辑路径（可撤销、委托与状态机自动同步）；
+    /// 仅预览模式下退化为直接改模型。
+    func replaceText(in range: NSRange, with replacement: String) -> Bool {
+        guard canEdit else { return false }
+        if let bridge = editorBridge {
+            return bridge.replaceSearchMatch(range: range, with: replacement)
+        }
+        let ns = text as NSString
+        guard range.location >= 0, range.length >= 0,
+              range.location + range.length <= ns.length else { return false }
+        userDidEdit(ns.replacingCharacters(in: range, with: replacement))
+        return true
+    }
+
+    /// 全部替换。返回实际替换处数（0 表示无变化）。
+    func replaceAllText(in ranges: [NSRange], with replacement: String) -> Int {
+        guard canEdit, !ranges.isEmpty else { return 0 }
+        if let bridge = editorBridge {
+            return bridge.replaceSearchMatches(ranges: ranges, with: replacement)
+        }
+        let ns = NSMutableString(string: text)
+        var applied = 0
+        // 从后往前改：前面的偏移不受影响，不需要逐次校正区间
+        for range in ranges.sorted(by: { $0.location > $1.location }) {
+            guard range.location >= 0, range.location + range.length <= ns.length else { continue }
+            ns.replaceCharacters(in: range, with: replacement)
+            applied += 1
+        }
+        if applied > 0 { userDidEdit(ns as String) }
+        return applied
     }
 
     // MARK: - 统计
