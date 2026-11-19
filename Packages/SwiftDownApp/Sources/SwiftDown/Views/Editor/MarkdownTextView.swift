@@ -16,9 +16,9 @@ final class MarkdownTextView: NSTextView {
     /// （500 处 × 每次全量同步 = 500 次字符串拷贝 + 500 次落盘调度）。
     private var batchDepth = 0
 
-    /// 已应用的查找高亮，用于下次清除。两个引擎分开记，互不干扰。
-    private var appliedSearchRangesTK2: [NSTextRange] = []
-    private var appliedSearchRangesTK1: [NSRange] = []
+    /// 已应用的查找高亮：记下每段**原来**的背景色，清除时原样还回去
+    /// （行内代码本身有底色，直接 removeAttribute 会把它抹掉）
+    private var appliedStorageHighlights: [(range: NSRange, previous: NSColor?)] = []
 
     // MARK: - 行索引
     //
@@ -195,61 +195,90 @@ final class MarkdownTextView: NSTextView {
         showFindIndicator(for: safe)
     }
 
-    /// 全部命中的临时高亮。
+    /// 全部命中的高亮。
     ///
-    /// 刻意**不**写进 textStorage：那会污染撤销栈、触发 `didChangeText`，
-    /// 还会被语法高亮整段覆盖。改用引擎的「临时/渲染属性」层：
-    /// - TextKit 2：`NSTextLayoutManager.addRenderingAttribute`
-    /// - TextKit 1：`NSLayoutManager.setTemporaryAttributes`
+    /// **为什么最终写进 `textStorage`**（而不是 TextKit 的渲染属性层）：
+    /// `NSTextLayoutManager.addRenderingAttribute` 在本项目实测「登记得上、画不出来」——
+    /// `enumerateRenderingAttributes` 能看到 `NSBackgroundColor` 确实挂在区间上，
+    /// 但屏幕上没有颜色。作废布局片段、强制重新布局、换颜色都试过，全无效；
+    /// 离屏渲染（`cacheDisplay`）反而画得出来，所以自检一直是绿的、真机是白的。
+    /// 已经布局过的大文档（用户文档 3.7 万字符、命中在 2.8 万处）必现。
     ///
-    /// 分流必须先问 `textLayoutManager`（判断顺序见设计文档：先 TK2 后 TK1），
-    /// 反了会把这个视图静默降级成 TextKit 1。
+    /// 写 textStorage 的三条副作用都做了封堵：
+    /// 1. **撤销**：全程 `disableUndoRegistration`，⌘Z 撤销的永远是用户自己的编辑；
+    /// 2. **回写模型**：`isApplyingProgrammaticChange` 置位，`didChangeText` 直接返回，
+    ///    不会出现「搜一下文档就变脏」；
+    /// 3. **被语法高亮覆盖**：记下每段原有的背景色（行内代码本身有底色），清除时原样还原。
     func applySearchHighlights(_ ranges: [NSRange], current: NSRange?) {
         clearSearchHighlights()
-        let length = (string as NSString).length
+        guard let storage = textStorage else { return }
+        let length = storage.length
         let valid = ranges.filter {
             $0.length > 0 && $0.location >= 0 && $0.location + $0.length <= length
         }
         guard !valid.isEmpty else { return }
 
-        if let layoutManager2 = textLayoutManager {
-            guard let content = layoutManager2.textContentManager else { return }
-            let origin = content.documentRange.location
-            for range in valid {
-                let color = highlightColor(for: range, current: current)
-                guard let start = content.location(origin, offsetBy: range.location),
-                      let end = content.location(start, offsetBy: range.length),
-                      let textRange = NSTextRange(location: start, end: end) else { continue }
-                layoutManager2.addRenderingAttribute(.backgroundColor, value: color, for: textRange)
-                appliedSearchRangesTK2.append(textRange)
-            }
-        } else if let layoutManager1 = layoutManager {
-            for range in valid {
-                let color = highlightColor(for: range, current: current)
-                layoutManager1.setTemporaryAttributes([.backgroundColor: color],
-                                                     forCharacterRange: range)
-                appliedSearchRangesTK1.append(range)
-            }
+        let undo = undoManager
+        let undoWasEnabled = undo?.isUndoRegistrationEnabled ?? false
+        undo?.disableUndoRegistration()
+        isApplyingProgrammaticChange = true
+        storage.beginEditing()
+        for range in valid {
+            let previous = storage.attribute(.backgroundColor, at: range.location,
+                                             effectiveRange: nil) as? NSColor
+            appliedStorageHighlights.append((range, previous))
+            storage.addAttribute(.backgroundColor,
+                                 value: highlightColor(for: range, current: current),
+                                 range: range)
         }
+        storage.endEditing()
+        isApplyingProgrammaticChange = false
+        if undoWasEnabled { undo?.enableUndoRegistration() }
+        needsDisplay = true
     }
 
     func clearSearchHighlights() {
-        if let layoutManager2 = textLayoutManager {
-            for range in appliedSearchRangesTK2 {
-                layoutManager2.removeRenderingAttribute(.backgroundColor, for: range)
+        guard let storage = textStorage else { return }
+        var touched = false
+
+        if !appliedStorageHighlights.isEmpty {
+            let undo = undoManager
+            let undoWasEnabled = undo?.isUndoRegistrationEnabled ?? false
+            undo?.disableUndoRegistration()
+            isApplyingProgrammaticChange = true
+            storage.beginEditing()
+            // 倒序还原：区间之间不会互相把偏移推歪
+            for entry in appliedStorageHighlights.reversed() {
+                guard entry.range.location >= 0,
+                      entry.range.location + entry.range.length <= storage.length else { continue }
+                if let previous = entry.previous {
+                    storage.addAttribute(.backgroundColor, value: previous, range: entry.range)
+                } else {
+                    storage.removeAttribute(.backgroundColor, range: entry.range)
+                }
             }
-        } else if let layoutManager1 = layoutManager {
-            for range in appliedSearchRangesTK1 {
-                layoutManager1.removeTemporaryAttribute(.backgroundColor, forCharacterRange: range)
-            }
+            storage.endEditing()
+            isApplyingProgrammaticChange = false
+            if undoWasEnabled { undo?.enableUndoRegistration() }
+            appliedStorageHighlights.removeAll(keepingCapacity: true)
+            touched = true
         }
-        appliedSearchRangesTK2.removeAll(keepingCapacity: true)
-        appliedSearchRangesTK1.removeAll(keepingCapacity: true)
+
+        if touched { needsDisplay = true }
     }
 
     private func highlightColor(for range: NSRange, current: NSRange?) -> NSColor {
-        // 当前命中用实色，其余压到 35%：一眼能分出「我现在在哪一处」
-        range == current ? .findHighlightColor : NSColor.findHighlightColor.withAlphaComponent(0.35)
+        // 当前命中用实色，其余压到 35%：一眼能分出「我现在在哪一处」。
+        //
+        // 刻意**不用** `NSColor.findHighlightColor`：它是 Catalog（动态系统）色，
+        // 交给 TextKit 2 的渲染属性当背景色时不会落色——不报错、不绘制，
+        // 表现为「查找栏有 1/24，正文一片干净」。离屏渲染（cacheDisplay）又画得出来，
+        // 所以自检是绿的、真机是白的。用具体 sRGB 值，按当前外观取深浅两套。
+        let isDark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        let base = isDark
+            ? NSColor(srgbRed: 0.42, green: 0.36, blue: 0.02, alpha: 1)
+            : NSColor(srgbRed: 1.00, green: 0.92, blue: 0.23, alpha: 1)
+        return range == current ? base : base.withAlphaComponent(0.35)
     }
 
     // MARK: - 替换（走标准编辑路径，撤销可回）

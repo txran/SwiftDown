@@ -12,6 +12,9 @@ final class AppEnvironment: ObservableObject {
         // 后续每一步都打点，日志里出现空档时就能判断空档落在哪一段。
         LaunchProbe.mark("AppEnvironment.init 进入")
         LaunchProbe.startWatchdog()
+        // 提示气泡（tooltip）默认要停 2～3 秒才出现，短标签按钮（Aa / W / .*）基本等不到。
+        // 用 AppKit 认的默认值把延迟压到 0.6 秒，让「悬停看说明」这件事真的可用。
+        UserDefaults.standard.register(defaults: ["NSInitialToolTipDelay": 0.6])
         // 自检跑在独立 UserDefaults 域里：真实用户的最近打开/快捷键/布局不能被测试污染
         let defaults: UserDefaults
         if CommandLine.arguments.contains("--selftest"),

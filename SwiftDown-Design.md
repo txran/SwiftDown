@@ -549,28 +549,61 @@ SwiftUI 没有中键手势，AppKit 也没有「既不抢左键、又能收到�
 - **所有标签**：跨已打开文件列出结果（文件 → 行号 → 预览片段，点击跳转）。**替换只对当前文档开放**，
   跨标签替换等于「一次改多个文件」，撤销语义与冲突处理的成本远超收益，明确不做。
 
-#### ADR-19 高亮写渲染属性层，不写 textStorage；替换走 `insertText(_:replacementRange:)`
+#### ADR-19 高亮写 textStorage（渲染属性在真机上不落色）；替换走 `insertText(_:replacementRange:)`
 
-（第十四轮。编号接 §4.10 的 ADR-18，本条因体量大另立小节。）
+（第十四轮定，第十五轮**推翻第一条**。编号接 §4.10 的 ADR-18，本条因体量大另立小节。）
 
-三个约束把方案逼到唯一解：
+**先说结论**：高亮最终写进 `textStorage` 的 `.backgroundColor`，三条副作用逐个封堵；
+替换走 `insertText(_:replacementRange:)`。下面保留当初的推理与被实测推翻的过程，因为这个坑值得记。
 
-1. **不能写 textStorage**。写进去会①污染撤销栈（用户按 ⌘Z 撤销的不是自己的编辑）、
-   ②触发 `didChangeText` → 回写模型 → 触发自动保存（搜索不该改脏状态）、
-   ③被语法高亮整段覆盖（两套属性反复互相盖，表现为高亮闪一下就没了）。
-   正解是引擎的「临时/渲染属性」层：TextKit 2 用 `NSTextLayoutManager.addRenderingAttribute(.backgroundColor, value:for:)`，
-   TextKit 1 用 `NSLayoutManager.setTemporaryAttributes`。两者都只影响绘制，不进文本、不进撤销栈。
-2. **分流顺序不能反**。必须先问 `textLayoutManager` 再问 `layoutManager`；先访问 `layoutManager`
-   会让 TextKit 2 视图**静默降级**成 TextKit 1（这是 ADR-09 已经付过一次代价的坑）。
-   另外 `NSTextLineFragment.characterRange` 是**元素相对**偏移，不是全文偏移，换算错的表现是
-   「所有命中都显示在第 1 行」而不是崩溃——自检里专门留了 200 行的回归项。
-3. **替换必须走标准编辑路径**。`insertText(_:replacementRange:)` 是 NSTextView 的正规入口，
-   撤销注册、委托通知、选区维护都由它完成。绕过它直接改 textStorage，撤销栈就接不上，
-   「⌘Z 撤不回来」是最难查的那类 bug。批量替换**倒序**执行（偏移大的先改），否则前面的区间会被后面的改动推歪；
-   外面套一层 `undoManager.beginUndoGrouping()` / `endUndoGrouping()`，N 次替换只算 1 步。
+##### 第一版（已作废）：用 TextKit 的渲染/临时属性层
 
-**高亮的视觉层级**：当前命中用实色 `.findHighlightColor`，其余压到 35% 透明度。
-像素实测（sRGB）当前处 ≈ 1.00/0.98/0.35，其余 ≈ 1.00/0.99/0.79——屏幕上确实分得开。
+推理很顺：写 textStorage 会①污染撤销栈（⌘Z 撤销的不是用户的编辑）、②触发 `didChangeText` →
+回写模型 → 触发自动保存、③被语法高亮整段覆盖。于是改用「只影响绘制、不进文本」的层：
+TextKit 2 用 `NSTextLayoutManager.addRenderingAttribute(.backgroundColor, value:for:)`，
+TextKit 1 用 `NSLayoutManager.setTemporaryAttributes`。
+
+**实测结果：登记得上，画不出来。** 交付给用户后得到的第一条反馈是「查找栏显示 1/24，正文一片干净」。
+排查记录：
+
+| 检查 | 结果 |
+|---|---|
+| `enumerateRenderingAttributes` 枚举 | `NSBackgroundColor` **确实挂在命中区间上**（3.7 万字符的文档，47 段登记） |
+| `textLayoutManager != nil` | true，确实走的是 TextKit 2 分支 |
+| 加属性后 `invalidateLayout(for:)` + `ensureLayout(for:)` | 无效 |
+| 加属性后 `needsDisplay = true` | 无效 |
+| 换颜色（`.findHighlightColor` → 具体 sRGB） | 无效 |
+| 同样的 API 换成 `.systemRed` 打在另一段 | **画得出来** |
+| 离屏渲染（`cacheDisplay`）同一份代码 | **画得出来** |
+
+也就是说：属性登记成功，屏幕不落色；而**离屏渲染画得出来**——所以像素级自检当时是绿的，
+真机是白的。这是「自检通过 ≠ 功能可用」最典型的一次。
+
+##### 第二版（现行）：写 textStorage，把三条副作用逐个堵住
+
+既然渲染属性在真实窗口里不可靠，就回到 `textStorage`，但当初的三个顾虑要一条条封：
+
+1. **撤销栈**：整个过程 `undoManager.disableUndoRegistration()` → `enableUndoRegistration()`；
+2. **回写模型**：置 `isApplyingProgrammaticChange`，`didChangeText` 直接返回；
+   并且这次编辑的 `editedMask` **只含 `.editedAttributes`、不含 `.editedCharacters`**
+   （自检用 `NSTextStorageDelegate` 观测，见下）；
+3. **被语法高亮覆盖**：上色前记下每段**原有**的 `.backgroundColor`（行内代码本身有底色），
+   清除时倒序原样还原，不是一律 `removeAttribute`。
+
+**高亮的视觉层级**：当前命中用实色，其余用 35% 透明度。颜色取**具体 sRGB 值**而不是
+`NSColor.findHighlightColor`（后者是 Catalog 动态色，作为渲染属性传下去也不落色）：
+浅色外观当前处 ≈ 1.00/0.92/0.23、其余 35% 叠白底 ≈ 淡黄；深色外观另有一套。
+
+
+**替换必须走标准编辑路径**：`insertText(_:replacementRange:)` 是 `NSTextView` 的正规入口，
+撤销注册、委托通知、选区维护都由它完成。绕过它直接改 textStorage，撤销栈就接不上，
+「⌘Z 撤不回来」是最难查的那类 bug。批量替换**倒序**执行（偏移大的先改，否则前面的区间会被推歪），
+外面套一层 `undoManager.beginUndoGrouping()` / `endUndoGrouping()`，N 次替换只算 1 步。
+
+**引擎分流顺序仍然不能反**：需要按引擎分支时（行号、选区分流等），必须先问 `textLayoutManager`
+再问 `layoutManager`；先访问 `layoutManager` 会让 TextKit 2 视图**静默降级**成 TextKit 1
+（ADR-09 已经付过一次代价）。另外 `NSTextLineFragment.characterRange` 是**元素相对**偏移，
+不是全文偏移，换算错的表现是「所有命中都显示在第 1 行」而不是崩溃——自检里留了 200 行的回归项。
 
 **跳转不抢焦点**：`jump(to:)` 只 `setSelectedRange` + `scrollRangeToVisible` + `showFindIndicator`，
 刻意不 `makeFirstResponder`。抢焦点会让用户打完一个字就被踢出输入框。
@@ -597,15 +630,31 @@ SwiftUI 没有中键手势，AppKit 也没有「既不抢左键、又能收到�
 | 状态 | 实色 px | 淡色 px |
 |---|---|---|
 | 未查找 | 0 | 0 |
-| 1 处命中 | 298 | 0 |
-| 3 处命中（当前 = 第 1 处） | 298 | 569 |
+| 1 处命中 | 224 | 0 |
+| 3 处命中（当前 = 第 1 处） | 224 | 477 |
 | 清除后 | 0 | 0 |
 
-`298 × 3 = 894 ≈ 298 + 569`，且实色恰好等于「一处」的量——同时证明了三件事：
-每处都画了、当前处与其余处的层级真的分开了、清除是干净的。
+实色恰好等于「一处」的量、淡色约等于两处——同时证明三件事：每处都画了、
+当前处与其余处的层级真的分开了、清除是干净的。
 
-#### 本轮踩到的两个坑
+**但像素自检有个致命的盲区**：离屏渲染（`cacheDisplay`）和真实窗口的绘制路径不一样。
+第一版用渲染属性时，离屏能画出黄色（298 px，全绿），真实窗口一片空白。
+所以现在除了像素，还补了三条**机制断言**，都跑在探针 `NSTextView` 上：
 
+| 断言 | 防的是 |
+|---|---|
+| 命中区间的 `.backgroundColor` 确实在 `textStorage` 里 | 只登记在引擎里、实际没落到文本 |
+| 这次编辑的 `editedMask` 只含 `.editedAttributes` | 有人改成「替换文本上高亮」→ 触发 `didChangeText` → 回写模型 |
+| 清除后行内代码的原底色被还原、原位无残留 | 一律 `removeAttribute` 会抹掉语法高亮自己的底色 |
+
+另外还有一条**真实路径**断言：先把整窗 `RootView` 挂起来、跑完首帧，**再**改查询词，
+然后断言编辑器出现高亮、`findNext()` 后选区落在第 3 处。这条挡的是
+「只在『先设查询再建视图』的顺序下才成立」——第一版正是靠首帧顺带应用叠加层蒙混过关的。
+
+#### 这一轮踩到的坑
+
+0. **渲染属性在真实窗口里不落色**（最贵的一个，详见上方 ADR-19）。它同时暴露了自检方法论的漏洞：
+   离屏像素为真，不代表真机为真。补了机制断言 + 真实路径断言之后才真正闭住。
 1. **`NSRegularExpression` 默认不认多行**：不带 `.anchorsMatchLines` 时 `^` 只匹配整段文本开头，
    不匹配每一行行首，`^dog` 搜不到第 2 行的 `dog`。自检直接抓到（那条断言当时是 FAIL）。
 2. **`Color.clear.frame(width:)` 会撑高整行**：`Color` 在**两个**轴向上都可扩展，只固定宽度时
@@ -614,8 +663,11 @@ SwiftUI 没有中键手势，AppKit 也没有「既不抢左键、又能收到�
    这个错误单看查找栏快照看不出来（那时 host 高度被写死），是**整窗快照**暴露的；
    现在补了一条固有高度断言（两行 68pt），把「看得见但断言不到」的错兜住。
 
-**通用结论**：凡是「画出来才算数」的能力（高亮、行号、光标、指示器），断言要落到像素或内容数组；
-凡是「布局对不对」的问题，快照必须包含**完整上下文**（整窗），单控件快照会把尺寸错误掩盖掉。
+**通用结论**：
+- 凡是「画出来才算数」的能力（高亮、行号、光标、指示器），断言要落到像素或内容数组；
+- 凡是「布局对不对」的问题，快照必须包含**完整上下文**（整窗），单控件快照会把尺寸错误掩盖掉；
+- **像素断言也只是必要条件**：离屏渲染和真实窗口的绘制路径可以不同，所以还要有一条
+  "把视图像真机一样挂起来、按真实操作顺序驱动"的端到端断言。
 
 ---
 

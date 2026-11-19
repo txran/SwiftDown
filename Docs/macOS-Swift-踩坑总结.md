@@ -362,6 +362,31 @@ NSRegularExpression(pattern: "^dog", options: [.anchorsMatchLines, .caseInsensit
 **判据**：任何用户可输入正则的地方，留一条「`^` 能命中第 2 行行首」的断言——
 这条断言挡住的不是崩溃，而是「明明有却搜不到」。
 
+### 3.9 TextKit 2 的渲染属性：登记得上，真机不落色
+
+给 `NSTextView` 加搜索高亮，用「只影响绘制、不进文本」的渲染属性层看起来是标准答案：
+
+```swift
+layoutManager.addRenderingAttribute(.backgroundColor, value: color, for: textRange)
+textView.needsDisplay = true
+```
+
+实测：`enumerateRenderingAttributes` 能把 `NSBackgroundColor` 枚举出来、区间正确，
+**但真实窗口里一点颜色都没有**。而同一份代码用离屏渲染（`cacheDisplay`）**画得出来**——
+于是像素级自检全绿，用户看到的是一片空白，白跑一轮。
+
+试过且无效：先 `ensureLayout` 再 add；add 之后 `invalidateLayout` + `ensureLayout`；
+`needsDisplay` / `displayIfNeeded`；换 `.findHighlightColor` → 具体 sRGB。
+唯一能画出颜色的是换 `.systemRed` 打在另一段——说明 API 本身可用，行为不可依赖。
+
+**可用替代**：写 `textStorage` 的 `.backgroundColor`，把三条副作用堵死：
+关撤销注册、只改属性不改字符（`editedMask` 只含 `.editedAttributes`）、
+上色前记下原有底色以便还原（行内代码本身有背景色）。
+
+**方法论**：离屏渲染验「内容对不对」可以，验「看不看得见」不行。
+渲染类结论至少要有一条跑在真实窗口 + 真实操作顺序上。
+
+
 ---
 
 ## 四、性能：先量数字再改结构
@@ -856,6 +881,8 @@ func saveNow() {
 | 正则 `^` 只命中全文开头 | `NSRegularExpression` 默认不按行锚定 | options 加 `.anchorsMatchLines` |
 | 查找高亮闪一下就没了 / ⌘Z 撤不回来 | 写进了 `textStorage` / 绕过了 `insertText` | 走渲染属性层 + 标准编辑入口 |
 | 快照看着正常，真机位置全错 | 只渲控件本身、还写死了高度 | 补整窗图 + 固有尺寸断言 |
+| 高亮属性登记了，屏幕没颜色 | 用了 TextKit 2 渲染属性 | 改写 `textStorage`，堵住撤销/回写/覆盖 |
+| 离屏自检全绿、真机全白 | 离屏与真机绘制路径不同 | 补一条真实窗口 + 真实操作顺序的断言 |
 
 ---
 

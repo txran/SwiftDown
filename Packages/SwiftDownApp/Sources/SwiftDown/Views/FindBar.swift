@@ -63,13 +63,16 @@ struct FindBar: View {
             .disabled(search.documentMatches.isEmpty)
 
             HStack(spacing: 2) {
-                optionToggle("Aa", help: "区分大小写", isOn: search.options.caseSensitive) {
+                optionToggle("Aa", help: "区分大小写：只找与输入完全同大小写的（默认不区分）",
+                             isOn: search.options.caseSensitive) {
                     search.options.caseSensitive.toggle()
                 }
-                optionToggle("W", help: "整词匹配", isOn: search.options.wholeWord) {
+                optionToggle("W", help: "整词匹配：只找完整单词，cats 不算 cat（中文整词按相邻字符判断）",
+                             isOn: search.options.wholeWord) {
                     search.options.wholeWord.toggle()
                 }
-                optionToggle(".*", help: "正则表达式", isOn: search.options.regex) {
+                optionToggle(".*", help: "正则表达式：支持 ^ $ \\d 等写法，例如 ^# 找所有一级标题",
+                             isOn: search.options.regex) {
                     search.options.regex.toggle()
                 }
             }

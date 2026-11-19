@@ -830,6 +830,49 @@ enum SelfTest {
                   "\(clearedPainted.strong + clearedPainted.faint) px（基线 \(blank.strong + blank.faint)）")
         }
 
+        // 9.6.7.2 高亮的**机制**约束：写 textStorage 但三条副作用必须被堵住
+        //
+        // 用户打回来过一次「查找栏有 1/24，正文一片干净」：当时用 TextKit 2 的渲染属性
+        // （addRenderingAttribute），属性登记得上、却画不出来，离屏渲染又画得出，所以自检全绿。
+        // 改成写 textStorage 才真的落色，于是这里把「为什么可以写」逐条钉住——
+        // 撤销栈不能脏、不能回写模型、行内代码原有底色要还原。
+        let mechProbe = MarkdownTextView(frame: NSRect(x: 0, y: 0, width: 420, height: 200))
+        mechProbe.string = "alpha beta alpha"
+        mechProbe.allowsUndo = true
+        var textChangeCallbacks = 0
+        mechProbe.onTextChange = { _ in textChangeCallbacks += 1 }
+        // 模拟行内代码底色：清除时必须还回这个颜色，而不是抹成无背景
+        let codeBackground = NSColor(srgbRed: 0.9, green: 0.9, blue: 0.95, alpha: 1)
+        mechProbe.textStorage?.addAttribute(.backgroundColor, value: codeBackground,
+                                           range: NSRange(location: 6, length: 4))
+        mechProbe.undoManager?.removeAllActions()
+        let maskProbe = EditMaskProbe()
+        mechProbe.textStorage?.delegate = maskProbe
+
+        mechProbe.applySearchHighlights([NSRange(location: 0, length: 5),
+                                         NSRange(location: 11, length: 5)],
+                                        current: NSRange(location: 0, length: 5))
+        let paintedBackground = mechProbe.textStorage?.attribute(.backgroundColor, at: 0,
+                                                                 effectiveRange: nil) as? NSColor
+        check("SR 高亮真的写进了文本属性（不是只登记在引擎里）", paintedBackground != nil,
+              String(describing: paintedBackground))
+        // 判别力：谁来一版「用替换文本的方式上高亮」，这条立刻变红
+        check("SR 高亮只改属性、不改字符（不会触发 didChangeText / 回写模型）",
+              maskProbe.sawCharacterEdit == false,
+              maskProbe.sawCharacterEdit ? "出现了 .editedCharacters" : "仅 .editedAttributes")
+        check("SR 高亮不回写模型（搜索不会把文档改脏）", textChangeCallbacks == 0,
+              "回调 \(textChangeCallbacks) 次")
+
+        mechProbe.clearSearchHighlights()
+        let restoredBackground = mechProbe.textStorage?.attribute(.backgroundColor, at: 6,
+                                                                  effectiveRange: nil) as? NSColor
+        let clearedBackground = mechProbe.textStorage?.attribute(.backgroundColor, at: 0,
+                                                                 effectiveRange: nil)
+        check("SR 清除高亮后行内代码的原底色被还原", restoredBackground == codeBackground,
+              String(describing: restoredBackground))
+        check("SR 清除高亮后原位没有残留背景色", clearedBackground == nil,
+              String(describing: clearedBackground))
+
         // 9.6.8 快捷键：默认无冲突 + 可在设置里改
         let defaultSignatures = ShortcutAction.allCases.map { $0.defaultBinding.signature }
         check("快捷键默认组合无重复",
@@ -874,6 +917,69 @@ enum SelfTest {
         if commandFItems.count != 1 {
             for line in keyEquivalentDump { print("[menu] \(line)") }
         }
+
+        // 9.6.10 真实路径：**视图已经存在之后**再改查询，编辑器必须收到高亮
+        //
+        // 这条是被用户打回来才补的。此前只验了「先设查询、再建视图」——
+        // 首次 updateNSView 顺带把叠加层应用上去，所以是绿的；
+        // 而真实用法是视图早就挂好了，用户才开始打字，走的是另一条分支。
+        // 判据照旧落到像素（渲染属性不进 textStorage，断言区间证明不了「画出来」）。
+        let liveFile = tempDirectory.appendingPathComponent("sr-live.md")
+        try? "# 甲\n\nalpha beta alpha\n\ngamma alpha\n".write(to: liveFile, atomically: true, encoding: .utf8)
+        let liveWorkspace = Workspace(settings: settings, restoreSessionOnInit: false)
+        liveWorkspace.open(url: liveFile)
+        for _ in 0..<30 {
+            if liveWorkspace.activeTab?.text.contains("alpha") == true { break }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        let liveHost = NSHostingView(rootView: RootView()
+            .environmentObject(settings)
+            .environmentObject(liveWorkspace)
+            .preferredColorScheme(settings.themeMode.colorScheme))
+        let liveSize = NSSize(width: 1180, height: 760)
+        liveHost.frame = NSRect(origin: .zero, size: liveSize)
+        let liveWindow = NSWindow(contentRect: NSRect(origin: .zero, size: liveSize),
+                                  styleMask: [.titled], backing: .buffered, defer: false)
+        liveWindow.contentView = liveHost
+        liveHost.layoutSubtreeIfNeeded()
+        try? await Task.sleep(nanoseconds: 400_000_000)   // 让首次 updateNSView 走完
+
+        func liveYellow() -> Int {
+            liveHost.displayIfNeeded()
+            guard let rep = SnapshotRenderer.capture(liveHost, size: liveSize) else { return -1 }
+            let split = yellowPixels(rep)
+            return split.strong + split.faint
+        }
+
+        let liveBefore = liveYellow()
+        liveWorkspace.showFind()
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        liveWorkspace.search.query = "alpha"
+        try? await Task.sleep(nanoseconds: 400_000_000)   // 等节流 + SwiftUI 更新
+
+        let liveMatches = liveWorkspace.search.documentMatches.count
+        check("SR 真实路径：查找栏开着、查询已生效", liveMatches == 3, "matches=\(liveMatches)")
+        let livePainted = liveYellow()
+        check("SR 真实路径：视图已存在时输入关键词，编辑器随即出现高亮",
+              livePainted > liveBefore + 200, "\(liveBefore) → \(livePainted) px")
+
+        // 同一路径再验上下跳转：跳到第 3 处后，当前命中（实色）必须落在第三处
+        liveWorkspace.findNext()
+        liveWorkspace.findNext()
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        check("SR 真实路径：下一处把游标推到第 3 处",
+              liveWorkspace.search.currentIndex == 2,
+              "index=\(liveWorkspace.search.currentIndex)/\(liveMatches)")
+        if let textView = collectTextViews(in: liveHost).first {
+            let selection = textView.selectedRange()
+            let third = liveWorkspace.search.documentMatches.last?.range
+            check("SR 真实路径：跳转真的选中了第 3 处",
+                  third.map { selection.location == $0.location && selection.length == $0.length } ?? false,
+                  "选区 \(selection) / 第 3 处 \(String(describing: third))")
+        } else {
+            check("SR 真实路径：找得到编辑器文本视图", false, "0 个 NSTextView")
+        }
+        liveWindow.contentView = nil
 
         // 临目录清理交给 defer（中途 return 也会执行）
         // 清掉自检写入的专用设置域与会话目录。
@@ -985,4 +1091,20 @@ enum SelfTest {
 /// 自检里跨闭包计数的最小容器（闭包内直接改局部 var 会触发并发检查）
 final class Counter {
     var value = 0
+}
+
+/// 观察一次文本编辑「改的是字符还是属性」。
+///
+/// 查找高亮必须只动属性：一旦 `editedMask` 里出现 `.editedCharacters`，
+/// `NSTextView` 会走 `didChangeText` → 回写模型 → 触发自动保存，
+/// 表现为「搜一下文档就变脏」。这条断言就是挡这个的。
+private final class EditMaskProbe: NSObject, NSTextStorageDelegate {
+    private(set) var sawCharacterEdit = false
+
+    func textStorage(_ textStorage: NSTextStorage,
+                     didProcessEditing editedMask: NSTextStorageEditActions,
+                     range editedRange: NSRange,
+                     changeInLength delta: Int) {
+        if editedMask.contains(.editedCharacters) { sawCharacterEdit = true }
+    }
 }
