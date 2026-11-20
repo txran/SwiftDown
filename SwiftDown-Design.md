@@ -669,6 +669,64 @@ TextKit 1 用 `NSLayoutManager.setTemporaryAttributes`。
 - **像素断言也只是必要条件**：离屏渲染和真实窗口的绘制路径可以不同，所以还要有一条
   "把视图像真机一样挂起来、按真实操作顺序驱动"的端到端断言。
 
+### 4.12 预览就地编辑与代码块滚动（PV，第十六轮追加）
+
+用户反馈：「预览模式下也支持文字修改轻量编辑」「鼠标放到预览代码块上，滚轮就不滑动了」。
+
+#### ADR-20 就地编辑编辑的是「块的源码」，不是所见即所得
+
+| 方案 | 做法 | 失效代价 |
+|---|---|---|
+| A 所见即所得 | 光标落在渲染层，按键改对应内联节点，再反写源区间 | 需要每个 inline 节点都记源区间并维护「渲染位置 ↔ 源位置」双向映射；软换行、行内代码、链接嵌套会把映射做成一个小型编译器，**映射错位就直接写坏用户格式** |
+| B 块源码编辑（采用） | 悬停块 → 铅笔 → 该块换成源码编辑框（预填这一段 Markdown）→ `⌘↩` 提交，整段替换 | 用户在框里看到 `**粗体**` 而不是粗体字；但不会产生任何语义魔法，diff 只动这一段 |
+
+选 B 的判据是失效代价而不是开发量：A 失败是「文档被写坏」，B 失败只是「看着不像预览」。
+
+**区间映射（`PreviewSourceMap`）**：块按 `sourceLine` 升序，第 i 块结束行 = 第 i+1 块
+起始行 − 1，再**削掉尾部空行**。削空行不是洁癖——不削的话块间空行会被卷进编辑区，
+提交时一起重写，用户改一个错别字，diff 里凭空多出空行的增删。
+
+**写回**统一走 `DocumentTab.replaceText(in:with:)`：
+
+- 拆分模式有编辑器 → `insertText(_:replacementRange:)`，撤销由 `NSTextView` 登记；
+- 纯预览模式无编辑器 → 直接改模型，需自己在窗口 `UndoManager` 上补一步，否则 ⌘Z 撤不回来；
+- 提交前校验「区间处原文仍是打开编辑框时那一份」，不一致就放弃写入（拆分模式下用户可能
+  同时在左侧敲字，字符偏移已失效，硬写会把别人的改动冲掉）。
+
+草稿状态挂在 `PreviewView` 而不是编辑框上：`LazyVStack` 会销毁滚出视口的行，
+状态跟着行走，滚一下草稿就没了。
+
+#### ADR-21 代码块的横向滚动不用 SwiftUI `ScrollView`
+
+原实现 `ScrollView(.horizontal)` 嵌在外层竖向 `ScrollView` 里。嵌套滚动容器是滚轮事件的
+经典坑：内层有能力消化滚动时，纵向 delta 会被它先吃掉，既不滚自己（它是横向的）也不往外交。
+
+改为自建 `PreviewCodeScrollView`（`NSScrollView` 子类），判定主导轴：
+竖向为主（含传统滚轮，`scrollingDeltaX` 恒为 0）→ 交给祖先里的竖向滚动视图；
+横向为主 → `super.scrollWheel` 自己处理。
+
+代码文本用只读 `NSTextView`：不换行（`widthTracksTextView = false` + 无限宽 `containerSize`），
+长行靠横向滚动看，选中复制照旧；文档视图宽度按 `layoutManager.usedRect` 算，**不能**用
+`autoresizingMask = .width`（那样长行被裁、横向滚动条永远不出现）。高度不用 `sizeThatFits`
+反过来问 SwiftUI（会差一帧），按「行数 × 行高 + 内边距」在 SwiftUI 侧算死。
+
+**这条的验证边界要说清楚**：自检里有「合成滚轮事件 → hitTest 真实命中路径 → 断言外层页面
+滚动」，但把旧实现放回去它照样 PASS（实测外层 `y 0 → 40`）——因为 AppKit 本来就会把
+未消费的滚轮事件往上层滚动视图传。真实滚轮的连续事件、惯性、触控板相位合成不出来。
+所以这条断言只是**回归保护**，不是「旧实现有 bug」的证据；手感结论只能实机确认。
+把它写进文档而不是假装验过，是这一轮最该记住的事。
+
+#### 本轮踩到的坑
+
+1. **`@State` 在本机编不过**。CLT 没有 `SwiftUIMacros` 插件，`@State` 直接报
+   `external macro implementation type 'SwiftUIMacros.StateMacro' could not be found`。
+   必须用 `@StateObject + LocalState<Value>`（项目既有约定）。这是固定约束，不是偶发错误。
+2. **合成事件只能验「路由」，验不了「手感」**。见上。
+3. **两套渲染目标必须共用同一份词法分类**。预览代码块改用只读 `NSTextView` 后需要
+   `NSAttributedString` 出口，于是把 `CodeHighlighter` 的切分抽成 `pieces(_:language:)`，
+   SwiftUI（`AttributedString`）与 AppKit（`NSAttributedString`）两个出口共用它，
+   否则关键字表一改就只改到一半，预览与别处高亮会漂移。
+
 ---
 
 ## 五、SyncCoordinator（分屏实时预览，FR-03）

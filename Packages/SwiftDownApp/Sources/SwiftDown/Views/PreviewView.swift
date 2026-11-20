@@ -9,6 +9,24 @@ struct PreviewView: View {
     @ObservedObject var tab: DocumentTab
     let bodySize: CGFloat
 
+    /// 悬停在哪一块（块的起始行）。只有悬停的块才显示右上角的铅笔。
+    /// 用 `LocalState` 而不是 `@State`：本机只有 CLT，SwiftUIMacros 插件缺失，`@State` 编不过。
+    @StateObject private var hoveredLine = LocalState<Int?>(nil)
+    /// 正在就地编辑的块；nil = 正常预览
+    @StateObject private var editing = LocalState<EditingBlock?>(nil)
+    /// 草稿放在这里而不是 `BlockSourceEditor` 内部：LazyVStack 会把滚出视口的行
+    /// 销毁重建，状态若挂在行上，滚一下草稿就没了。
+    @StateObject private var draft = LocalState("")
+
+    @Environment(\.undoManager) private var undoManager
+
+    private struct EditingBlock: Equatable {
+        let line: Int
+        let range: NSRange
+        let label: String
+        let original: String
+    }
+
     var body: some View {
         Group {
             if tab.isReadOnly {
@@ -31,10 +49,8 @@ struct PreviewView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 12) {
-                    ForEach(Array(tab.ast.blocks.enumerated()), id: \.offset) { _, block in
-                        BlockView(block: block,
-                                  baseDirectory: tab.url.deletingLastPathComponent(),
-                                  bodySize: bodySize)
+                    ForEach(Array(tab.ast.blocks.enumerated()), id: \.offset) { index, block in
+                        blockRow(block, next: nextBlock(after: index))
                             .id(Self.anchor(for: block))
                     }
                 }
@@ -52,6 +68,102 @@ struct PreviewView: View {
             .onChange(of: tab.revision) { _ in
                 tab.lastAlignedAnchorLine = -1
             }
+        }
+    }
+
+    private func nextBlock(after index: Int) -> BlockNode? {
+        let blocks = tab.ast.blocks
+        let next = index + 1
+        return blocks.indices.contains(next) ? blocks[next] : nil
+    }
+
+    // MARK: - 一块：正常渲染 / 就地编辑
+
+    @ViewBuilder
+    private func blockRow(_ block: BlockNode, next: BlockNode?) -> some View {
+        if let active = editing.value, active.line == block.sourceLine {
+            BlockSourceEditor(label: active.label,
+                              fontSize: max(11, bodySize - 1),
+                              draft: $draft.value,
+                              onCommit: commitEdit,
+                              onCancel: { editing.value = nil })
+        } else {
+            BlockView(block: block,
+                      baseDirectory: tab.url.deletingLastPathComponent(),
+                      bodySize: bodySize)
+                .overlay(alignment: .topTrailing) { editAffordance(block, next: next) }
+                .onHover { inside in
+                    if inside {
+                        hoveredLine.value = block.sourceLine
+                    } else if hoveredLine.value == block.sourceLine {
+                        hoveredLine.value = nil
+                    }
+                }
+        }
+    }
+
+    @ViewBuilder
+    private func editAffordance(_ block: BlockNode, next: BlockNode?) -> some View {
+        if tab.canEdit, editing.value == nil, hoveredLine.value == block.sourceLine {
+            Button {
+                beginEdit(block, next: next)
+            } label: {
+                Image(systemName: "pencil")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 20, height: 20)
+                    .background(Circle().fill(Color(nsColor: .controlBackgroundColor)))
+                    .overlay(Circle().stroke(Color(nsColor: .separatorColor), lineWidth: 0.6))
+            }
+            .buttonStyle(.plain)
+            .help("编辑这一块（从第 \(block.sourceLine) 行起的 Markdown 源码）")
+            .padding(2)
+        }
+    }
+
+    // MARK: - 轻量编辑
+
+    private func beginEdit(_ block: BlockNode, next: BlockNode?) {
+        let map = PreviewSourceMap(text: tab.text)
+        guard let range = map.range(startLine: block.sourceLine,
+                                    nextBlockLine: next?.sourceLine) else { return }
+        let source = map.text(in: range)
+        draft.value = source
+        editing.value = EditingBlock(line: block.sourceLine,
+                                     range: range,
+                                     label: map.lineLabel(for: range),
+                                     original: source)
+        hoveredLine.value = nil
+    }
+
+    private func commitEdit() {
+        guard let active = editing.value else { return }
+        editing.value = nil
+        guard draft.value != active.original else { return }
+
+        let inserted = draft.value
+        let original = active.original
+        let range = active.range
+
+        // 编辑期间正文可能被别处改过（拆分模式下用户能同时在左侧敲字）。
+        // 区间处的原文若已不是当初那一份，宁可放弃写入，也不要把别人的改动冲掉。
+        let ns = tab.text as NSString
+        guard NSMaxRange(range) <= ns.length,
+              ns.substring(with: range) == original else { return }
+
+        guard tab.replaceText(in: range, with: inserted) else { return }
+
+        // 纯预览模式没有编辑器，`NSTextView` 不会替我们登记撤销，自己补一步。
+        // 拆分模式下走的是 `insertText(_:replacementRange:)`，撤销已由编辑器处理。
+        if tab.editorBridge == nil, let undoManager {
+            let newRange = NSRange(location: range.location,
+                                   length: (inserted as NSString).length)
+            undoManager.registerUndo(withTarget: tab) { target in
+                Task { @MainActor in
+                    _ = target.replaceText(in: newRange, with: original)
+                }
+            }
+            undoManager.setActionName("编辑预览")
         }
     }
 
@@ -307,6 +419,10 @@ struct CodeBlockView: View {
     let code: String
     let bodySize: CGFloat
 
+    /// 代码块内边距（横向给滚动留呼吸，纵向与行对齐）
+    private var codeInset: NSSize { NSSize(width: 12, height: 10) }
+    private var codeFontSize: CGFloat { bodySize - 1 }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             if let language, !language.isEmpty {
@@ -316,13 +432,13 @@ struct CodeBlockView: View {
                     .padding(.horizontal, 12)
                     .padding(.top, 8)
             }
-            ScrollView(.horizontal, showsIndicators: false) {
-                Text(CodeHighlighter.highlighted(code, language: language, size: bodySize - 1))
-                    .textSelection(.enabled)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
+            // 刻意不用 `ScrollView(.horizontal)`：嵌套在外层竖向滚动里会把纵向滚轮吃掉，
+            // 鼠标停在代码块上就滚不动页面（见 PreviewCodeView 的说明）。
+            CodeBlockText(attributed: CodeHighlighter.highlightedNS(code, language: language,
+                                                                  size: codeFontSize),
+                          fontSize: codeFontSize,
+                          inset: codeInset)
+                .frame(height: CodeBlockText.height(for: code, fontSize: codeFontSize, inset: codeInset))
         }
         .background(Color(nsColor: .quaternaryLabelColor).opacity(0.22))
         .clipShape(RoundedRectangle(cornerRadius: 7))

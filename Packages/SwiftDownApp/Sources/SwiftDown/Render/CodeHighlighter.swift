@@ -57,11 +57,43 @@ enum CodeHighlighter {
     ]
 
     static func highlighted(_ code: String, language: String?, size: CGFloat) -> AttributedString {
+        var result = AttributedString()
+        for (text, kind) in pieces(code, language: language) {
+            append(&result, text, kind: kind, size: size)
+        }
+        return result.characters.isEmpty ? AttributedString(code) : result
+    }
+
+    /// AppKit 版：预览的代码块挂在只读 `NSTextView` 上（为了横向不换行 + 滚轮穿透，
+    /// 见 `PreviewCodeView`），所以要多一条 `NSAttributedString` 出口。
+    /// 词法分类与 SwiftUI 版共用 `pieces`，两边不会漂移。
+    static func highlightedNS(_ code: String, language: String?, size: CGFloat) -> NSAttributedString {
+        let font = NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
+        let result = NSMutableAttributedString()
+        for (text, kind) in pieces(code, language: language) {
+            var attrs: [NSAttributedString.Key: Any] = [.font: font]
+            switch kind {
+            case .keyword: attrs[.foregroundColor] = NSColor.systemPink
+            case .string: attrs[.foregroundColor] = NSColor.systemRed
+            case .comment: attrs[.foregroundColor] = NSColor.secondaryLabelColor
+            case .number: attrs[.foregroundColor] = NSColor.systemOrange
+            case .plain: break
+            }
+            result.append(NSAttributedString(string: text, attributes: attrs))
+        }
+        if result.length == 0 {
+            return NSAttributedString(string: code, attributes: [.font: font])
+        }
+        return result
+    }
+
+    /// 词法切分：返回「片段 + 类别」，两种渲染目标各自拼装
+    private static func pieces(_ code: String, language: String?) -> [(String, TokenKind)] {
         let lang = (language ?? "").lowercased().trimmingCharacters(in: .whitespaces)
         let keywordSet = keywords[normalize(lang)] ?? []
         let commentPrefix = commentPrefixes[normalize(lang)] ?? ["//"]
 
-        var result = AttributedString()
+        var result: [(String, TokenKind)] = []
         let ns = code as NSString
         let full = NSRange(location: 0, length: ns.length)
 
@@ -70,16 +102,16 @@ enum CodeHighlighter {
             if match.range.location > lastEnd {
                 let gap = ns.substring(with: NSRange(location: lastEnd,
                                                     length: match.range.location - lastEnd))
-                append(&result, gap, kind: .plain, size: size)
+                result.append((gap, .plain))
             }
             let token = ns.substring(with: match.range)
-            append(&result, token, kind: classify(token, keywords: keywordSet, commentPrefix: commentPrefix), size: size)
+            result.append((token, classify(token, keywords: keywordSet, commentPrefix: commentPrefix)))
             lastEnd = NSMaxRange(match.range)
         }
         if lastEnd < ns.length {
-            append(&result, ns.substring(from: lastEnd), kind: .plain, size: size)
+            result.append((ns.substring(from: lastEnd), .plain))
         }
-        return result.characters.isEmpty ? AttributedString(code) : result
+        return result
     }
 
     private static func normalize(_ lang: String) -> String {

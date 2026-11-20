@@ -386,6 +386,66 @@ textView.needsDisplay = true
 **方法论**：离屏渲染验「内容对不对」可以，验「看不看得见」不行。
 渲染类结论至少要有一条跑在真实窗口 + 真实操作顺序上。
 
+### 3.10 嵌套滚动容器会吃掉滚轮
+
+```
+ScrollView（纵向，页面）
+ └─ ScrollView(.horizontal)（代码块）
+```
+
+鼠标停在代码块上滚轮不动——内层容器有能力消化滚动时，纵向 delta 会被它先吃掉，
+既不滚自己（它是横向的）也不往外交。
+
+修法二选一：
+1. **不嵌套**：自建 `NSScrollView` 子类，`scrollWheel` 里判主导轴，竖向为主就交给祖宗的
+   竖向滚动视图（`superview` 链上找第一个 `NSScrollView`，直接调它的 `scrollWheel`）：
+   ```swift
+   override func scrollWheel(with event: NSEvent) {
+       if abs(event.scrollingDeltaY) >= abs(event.scrollingDeltaX) {
+           enclosingScrollView()?.scrollWheel(with: event)   // 竖向交还给外层
+       } else {
+           super.scrollWheel(with: event)                     // 横向自己滚
+       }
+   }
+   ```
+2. 让内层容器**没有可滚动的纵向内容**（`hasVerticalScroller = false` + 不随宽度换行）。
+
+配套的两个细节：
+- 只读代码文本要**不换行**：`textContainer.widthTracksTextView = false` +
+  `containerSize = (greatestFiniteMagnitude, greatestFiniteMagnitude)`；
+  文档视图宽度按 `layoutManager.usedRect` 算，**别用** `autoresizingMask = .width`（长行会被裁）。
+- 高度别用 `sizeThatFits` 反过来问 SwiftUI：先 `updateNSView` 换文本、再审尺寸，中间会差一帧
+  （先出 14pt 再跳）。不换行时高度只取决于行数，直接 `行数 × 行高 + 内边距` 算死。
+
+**验证的坑**：合成滚轮事件（`CGEvent(scrollWheelEvent2Source:…)` → `NSEvent(cgEvent:)`）
+**验不出这件事**。把旧的嵌套实现放回去，同样的事件下外层页面照样滚（实测 40pt）——
+AppKit 本来就会把「未被消费的滚轮事件」往上层滚动视图传。合成事件只能验路由，
+验不了连续事件 / 惯性 / 触控板相位。手感类修复要实机确认，别拿合成事件当证据。
+
+### 3.11 CLT 环境下 `@State` 编不过
+
+只有 Command Line Tools、没有完整 Xcode 时，`@State` 这类由 **SwiftUIMacros** 插件展开的
+属性包装器直接编译失败：
+
+```
+error: external macro implementation type 'SwiftUIMacros.StateMacro'
+could not be found for macro 'State()'; plugin for module 'SwiftUIMacros' not found
+```
+
+`@ObservedObject` / `@StateObject` / `@Binding` / `@Environment` / `@FocusState` 都是
+Swift 语言内置的属性包装器，不受影响。替代方案是 `@StateObject` + 一个引用类型容器：
+
+```swift
+final class LocalState<Value>: ObservableObject {
+    @Published var value: Value
+    init(_ value: Value) { self.value = value }
+}
+// 用法：@StateObject private var hover = LocalState(false)
+//      取值 hover.value，绑定 $hover.value
+```
+
+行为等价（视图重建时状态保持、值变触发刷新），代价是所有读写都要多点一个 `.value`。
+
 
 ---
 
@@ -883,6 +943,9 @@ func saveNow() {
 | 快照看着正常，真机位置全错 | 只渲控件本身、还写死了高度 | 补整窗图 + 固有尺寸断言 |
 | 高亮属性登记了，屏幕没颜色 | 用了 TextKit 2 渲染属性 | 改写 `textStorage`，堵住撤销/回写/覆盖 |
 | 离屏自检全绿、真机全白 | 离屏与真机绘制路径不同 | 补一条真实窗口 + 真实操作顺序的断言 |
+| 鼠标停在代码块/内嵌区域上滚轮不动 | 嵌套滚动容器吃掉了纵向 delta | 内层判主导轴，竖向交还外层（3.10） |
+| `@State` 报 `SwiftUIMacros ... could not be found` | CLT 环境缺宏插件 | `@StateObject` + `LocalState<Value>`（3.11） |
+| 合成滚轮/鼠标事件验过，真机手感还是不对 | 合成事件只能验路由，验不了连续事件与惯性 | 手感类结论实机确认，别拿合成事件当证据 |
 
 ---
 

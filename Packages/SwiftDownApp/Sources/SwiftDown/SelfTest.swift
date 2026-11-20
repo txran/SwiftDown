@@ -2,6 +2,7 @@ import AppKit
 import CoreGraphics
 import Foundation
 import SwiftDownCore
+import SwiftDownPipeline
 import SwiftUI
 
 /// 无头自检（`SwiftDown --selftest <file>`）。
@@ -981,6 +982,197 @@ enum SelfTest {
         }
         liveWindow.contentView = nil
 
+        // 9.7 预览增强（PV）：代码块滚轮穿透 + 就地轻量编辑
+        //
+        // 这两条都是「手感」问题，用户报的原话是「鼠标放到预览代码块上，滚轮就不滑动了」
+        // 和「预览模式也支持文字修改」。手感问题不能只靠看代码确认，得跑真事件。
+
+        // 9.7.1 源区间映射：把 AST 的块换算回原文区间，边界必须精确到「不多一行」
+        //
+        // 多一行的后果很具体：块与块之间的空行会被卷进编辑区，提交时一起重写，
+        // 用户只改一个错别字，diff 里凭空多出空行的增删。
+        let rangeSample = "# 标题\n\n第一段\n第二行\n\n```swift\nlet a = 1\n```\n\n- 甲\n- 乙\n\n最后一段"
+        let rangeMap = PreviewSourceMap(text: rangeSample)
+        let rangeBlocks = (try? SwiftMarkdownParser().parse(rangeSample))?.blocks ?? []
+        check("PV 源区间：样例解析出 5 个顶层块", rangeBlocks.count == 5, "\(rangeBlocks.count)")
+
+        func sourceSlice(at index: Int) -> String? {
+            let next = index + 1 < rangeBlocks.count ? rangeBlocks[index + 1].sourceLine : nil
+            guard let range = rangeMap.range(startLine: rangeBlocks[index].sourceLine,
+                                             nextBlockLine: next) else { return nil }
+            return rangeMap.text(in: range)
+        }
+
+        check("PV 源区间：标题只含自己那一行",
+              sourceSlice(at: 0) == "# 标题", sourceSlice(at: 0) ?? "nil")
+        check("PV 源区间：段落两行都收进来、尾部空行不收",
+              sourceSlice(at: 1) == "第一段\n第二行", sourceSlice(at: 1) ?? "nil")
+        check("PV 源区间：代码块含上下围栏",
+              sourceSlice(at: 2) == "```swift\nlet a = 1\n```", sourceSlice(at: 2) ?? "nil")
+        check("PV 源区间：列表覆盖全部子项",
+              sourceSlice(at: 3) == "- 甲\n- 乙", sourceSlice(at: 3) ?? "nil")
+        check("PV 源区间：最后一块到文末（文件末尾无换行）",
+              sourceSlice(at: 4) == "最后一段", sourceSlice(at: 4) ?? "nil")
+        if let thirdBlockRange = rangeMap.range(startLine: rangeBlocks[2].sourceLine,
+                                                nextBlockLine: rangeBlocks[3].sourceLine) {
+            check("PV 源区间：行号标签写的是真实行号",
+                  rangeMap.lineLabel(for: thirdBlockRange) == "第 6–8 行",
+                  rangeMap.lineLabel(for: thirdBlockRange))
+        }
+
+        // 9.7.2 轻量编辑端到端：改一段 → 正文真的变了 → AST 重新解析 → 进未保存态
+        let previewFile = tempDirectory.appendingPathComponent("pv-preview.md")
+        let longCode = (1...8).map { "let value\($0) = \($0)" }.joined(separator: "\n")
+            + "\nlet veryLongLine = \"" + String(repeating: "x", count: 240) + "\""
+        let previewSource = """
+        # 预览标题
+
+        第一段正文，用来验证就地编辑。
+
+        ```swift
+        \(longCode)
+        ```
+
+        """ + (1...40).map { "第 \($0) 段填充正文，把文档撑长到外层可以滚动。" }.joined(separator: "\n\n")
+
+        try? previewSource.write(to: previewFile, atomically: true, encoding: .utf8)
+        let previewWorkspace = Workspace(settings: settings, restoreSessionOnInit: false)
+        previewWorkspace.open(url: previewFile)
+        for _ in 0..<40 {
+            if let blocks = previewWorkspace.activeTab?.ast.blocks, blocks.count >= 40 { break }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+
+        guard let previewTab = previewWorkspace.activeTab else {
+            check("PV 预览文档打开成功", false, "activeTab 为空")
+            return
+        }
+        check("PV 预览文档打开成功，块数符合预期",
+              previewTab.ast.blocks.count >= 40, "\(previewTab.ast.blocks.count) 块")
+
+        // 就地编辑第 2 块（那段正文）：与 UI 里点击铅笔后走的是同一段代码路径
+        if previewTab.ast.blocks.count >= 2 {
+            let paragraph = previewTab.ast.blocks[1]
+            let editMap = PreviewSourceMap(text: previewTab.text)
+            let nextLine = previewTab.ast.blocks[2].sourceLine
+            if let range = editMap.range(startLine: paragraph.sourceLine, nextBlockLine: nextLine) {
+                let original = editMap.text(in: range)
+                check("PV 就地编辑：取到的是那一段原文",
+                      original == "第一段正文，用来验证就地编辑。", original)
+                _ = previewTab.replaceText(in: range, with: "改过之后的正文。")
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                check("PV 就地编辑：正文被整段替换",
+                      previewTab.text.contains("改过之后的正文。") && !previewTab.text.contains("用来验证就地编辑"),
+                      previewTab.text.prefix(40).description)
+                let reparsed = previewTab.ast.blocks.contains { block in
+                    if case .paragraph(let inlines, _) = block {
+                        return String(InlineRenderer.attributed(inlines, size: 12).characters)
+                            .contains("改过之后的正文")
+                    }
+                    return false
+                }
+                check("PV 就地编辑：AST 重新解析后内容同步", reparsed)
+                check("PV 就地编辑：改动进入未保存态", isDirty(previewTab), stateLabel(previewTab))
+            } else {
+                check("PV 就地编辑：算得出该段的源区间", false)
+            }
+        }
+
+        // 9.7.3 代码块滚轮：竖向事件必须穿透到外层页面
+        //
+        // 原来的实现是 `ScrollView(.horizontal)` 套在外层竖向 ScrollView 里，用户报「鼠标停到
+        // 代码块上滚轮就不动了」，所以改成自建的横向 `NSScrollView` + 显式竖向转发。
+        //
+        // **这条断言的诚实边界**：它**抓不住**旧实现。用同样的合成事件跑旧代码，外层照样滚
+        // （AppKit 对未能消费的滚轮事件本来就会往上层滚动视图传），所以它只是「新实现没把
+        // 滚动搞坏」的回归保护，不是「旧实现有 bug」的证据。真实滚轮的手感（连续事件、
+        // 惯性、触控板相位）合成不出来，只能实机确认。记在这里，免得下次误以为它证明了一切。
+        let pvHost = NSHostingView(rootView: PreviewView(tab: previewTab,
+                                                        bodySize: settings.fontSize + 1))
+        let pvSize = NSSize(width: 1180, height: 760)
+        pvHost.frame = NSRect(origin: .zero, size: pvSize)
+        let pvWindow = NSWindow(contentRect: NSRect(origin: .zero, size: pvSize),
+                                styleMask: [.titled], backing: .buffered, defer: false)
+        pvWindow.contentView = pvHost
+        pvHost.layoutSubtreeIfNeeded()
+        try? await Task.sleep(nanoseconds: 400_000_000)
+
+        let codeScrolls = Self.collectViews(PreviewCodeScrollView.self, in: pvHost)
+        check("PV 代码块用的是可穿透滚轮的容器", codeScrolls.count == 1, "\(codeScrolls.count) 个")
+        check("PV 代码块容器里挂的是只读文本视图",
+              codeScrolls.first?.documentView is NSTextView && (codeScrolls.first?.documentView as? NSTextView)?.isEditable == false)
+
+        // 判据刻意**不**依赖具体实现，而是走真实命中路径：
+        // 先按坐标做 hitTest（这正是 AppKit 派发滚轮事件的方式），再把事件交给命中的视图。
+        // 内层容器按「视图树里最外层滚动视图之下的那个」来找，新旧实现都适用——
+        // 只有这样才验得出「这条断言到底抓不抓得住原来的 bug」（旧实现下它必须 FAIL）。
+        let allScrolls = Self.collectViews(NSScrollView.self, in: pvHost)
+        let outerScroll = allScrolls.first { Self.ancestorScrollView(of: $0) == nil }
+        if let outer = outerScroll {
+            let innerScrolls = allScrolls.filter {
+                $0 !== outer && Self.ancestorScrollView(of: $0) === outer
+            }
+            let outerClip = outer.contentView
+
+            func deliverScrollToCodeBlock(dx: Int32, dy: Int32) -> Bool {
+                guard let inner = innerScrolls.first else { return false }
+                let pointInInner = NSPoint(x: 8, y: inner.bounds.midY)
+                let pointInHost = inner.convert(pointInInner, to: pvHost)
+                let pointInParent = pvHost.convert(pointInHost, to: pvHost.superview)
+                guard let hit = pvHost.superview?.hitTest(pointInParent),
+                      let event = Self.syntheticScrollEvent(dx: dx, dy: dy) else { return false }
+                hit.scrollWheel(with: event)
+                return true
+            }
+
+            check("PV 代码块附近能找到内层滚动容器", innerScrolls.count >= 1, "\(innerScrolls.count) 个")
+
+            let outerBefore = outerClip.bounds.origin.y
+            let delivered = deliverScrollToCodeBlock(dx: 0, dy: -80)
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            let outerAfter = outerClip.bounds.origin.y
+            check("PV 竖向滚轮停在代码块上，外层页面照样滚动",
+                  delivered && outerAfter > outerBefore + 1,
+                  "外层 y \(Int(outerBefore)) → \(Int(outerAfter))")
+
+            let innerClip = innerScrolls.first?.contentView
+            let innerXBefore = innerClip?.bounds.origin.x ?? 0
+            let outerBeforeHorizontal = outerClip.bounds.origin.y
+            _ = deliverScrollToCodeBlock(dx: -120, dy: 0)
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            check("PV 横向滚动只动代码块自己，不推动页面",
+                  (innerClip?.bounds.origin.x ?? 0) > innerXBefore + 1
+                    && abs(outerClip.bounds.origin.y - outerBeforeHorizontal) < 1,
+                  "内层 x \(Int(innerXBefore)) → \(Int(innerClip?.bounds.origin.x ?? 0))，"
+                    + "外层 y \(Int(outerBeforeHorizontal)) → \(Int(outerClip.bounds.origin.y))")
+        } else {
+            check("PV 找得到代码块外层的页面滚动视图", false)
+        }
+        pvWindow.contentView = nil
+
+        // 视觉回归：预览整页（代码块 + 长行横向滚动条 + 段落）
+        previewTab.requestScroll(toLine: 1)
+        let pvSnapshotHost = NSHostingView(rootView: PreviewView(tab: previewTab,
+                                                                bodySize: settings.fontSize + 1))
+        pvSnapshotHost.frame = NSRect(origin: .zero, size: pvSize)
+        pvSnapshotHost.layoutSubtreeIfNeeded()
+        snapshotView(pvSnapshotHost, to: "/tmp/swiftdown-preview-blocks.png", size: pvSize)
+
+        // 视觉回归：就地编辑框（铅笔只在悬停时出现，整页快照里抓不到，单独渲一次）
+        let editorProbe = NSHostingView(rootView: BlockSourceEditor(
+            label: "第 3–4 行",
+            fontSize: 13,
+            draft: .constant("第一段正文，用来验证就地编辑。\n第二行也在这块里。"),
+            onCommit: {},
+            onCancel: {}
+        ))
+        editorProbe.frame = NSRect(x: 0, y: 0, width: 760, height: 170)
+        editorProbe.layoutSubtreeIfNeeded()
+        snapshotView(editorProbe, to: "/tmp/swiftdown-preview-editor.png",
+                     size: NSSize(width: 760, height: 170))
+        check("PV 编辑框高度随内容（两行不能塌成一行）",
+              editorProbe.fittingSize.height > 60, "\(Int(editorProbe.fittingSize.height))pt")
+
         // 临目录清理交给 defer（中途 return 也会执行）
         // 清掉自检写入的专用设置域与会话目录。
         // 注意：以前这里删的是用户真实的 `Application Support/SwiftDown/session.json`——
@@ -990,6 +1182,40 @@ enum SelfTest {
 
         print("=== 自检结束：\("通过 \(failures == 0 ? "全部" : "")，失败 \(failures) 项") ===")
         print("SELFTEST RESULT: \(failures == 0 ? "ALL PASS" : "\(failures) FAILED")")
+    }
+
+    /// 构造合成滚轮事件（`wheel1` = 纵向，`wheel2` = 横向）。
+    ///
+    /// `NSEvent` 没有公开的滚轮构造器，只有 `CGEvent` 能塞进两个轴的偏移。
+    /// 拿到事件后直接喂给 `NSView.scrollWheel(with:)`——那是真实滚轮的入口，
+    /// 不需要窗口真的显示在屏幕上。
+    static func syntheticScrollEvent(dx: Int32, dy: Int32) -> NSEvent? {
+        let source = CGEventSource(stateID: .combinedSessionState)
+        guard let cg = CGEvent(scrollWheelEvent2Source: source, units: .line,
+                               wheelCount: 2, wheel1: dy / 20, wheel2: dx / 20, wheel3: 0) else { return nil }
+        return NSEvent(cgEvent: cg)
+    }
+
+    /// 按类型收集视图树里的所有实例
+    @MainActor
+    private static func collectViews<T: NSView>(_ type: T.Type, in view: NSView) -> [T] {
+        var result: [T] = []
+        if let match = view as? T { result.append(match) }
+        for subview in view.subviews {
+            result.append(contentsOf: collectViews(type, in: subview))
+        }
+        return result
+    }
+
+    /// 视图树里最近的外层滚动视图（用来验证「滚轮有没有穿透」）
+    @MainActor
+    private static func ancestorScrollView(of view: NSView) -> NSScrollView? {
+        var current = view.superview
+        while let candidate = current {
+            if let scroll = candidate as? NSScrollView { return scroll }
+            current = candidate.superview
+        }
+        return nil
     }
 
     /// 构造合成鼠标事件。
