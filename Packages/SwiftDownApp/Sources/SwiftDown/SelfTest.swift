@@ -1158,20 +1158,213 @@ enum SelfTest {
         pvSnapshotHost.layoutSubtreeIfNeeded()
         snapshotView(pvSnapshotHost, to: "/tmp/swiftdown-preview-blocks.png", size: pvSize)
 
-        // 视觉回归：就地编辑框（铅笔只在悬停时出现，整页快照里抓不到，单独渲一次）
-        let editorProbe = NSHostingView(rootView: BlockSourceEditor(
-            label: "第 3–4 行",
-            fontSize: 13,
-            draft: .constant("第一段正文，用来验证就地编辑。\n第二行也在这块里。"),
-            onCommit: {},
-            onCancel: {}
+        // 9.7.5 真实点击：对点击层调 `mouseDown`，走的就是真人点下去的那条入口
+        //
+        // 上一轮「悬停出现铅笔」就是因为没验这一环，交付时才被用户打回来（点不出来）。
+        // 这里不再用合成事件去喂 SwiftUI 手势（实测驱动不了），而是点 AppKit 视图本身。
+        let clickFile = tempDirectory.appendingPathComponent("pv-click.md")
+        try? "# 标题\n\n点击这一段文字就应该进入编辑。\n".write(to: clickFile,
+                                                              atomically: true, encoding: .utf8)
+        let clickWorkspace = Workspace(settings: settings, restoreSessionOnInit: false)
+        clickWorkspace.open(url: clickFile)
+        for _ in 0..<30 {
+            if clickWorkspace.activeTab?.ast.blocks.count ?? 0 >= 2 { break }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        if let clickTab = clickWorkspace.activeTab {
+            let clickHost = NSHostingView(rootView: PreviewView(tab: clickTab, bodySize: 15))
+            let clickSize = NSSize(width: 900, height: 600)
+            clickHost.frame = NSRect(origin: .zero, size: clickSize)
+            let clickWindow = NSWindow(contentRect: NSRect(origin: .zero, size: clickSize),
+                                       styleMask: [.titled], backing: .buffered, defer: false)
+            clickWindow.contentView = clickHost
+            clickHost.layoutSubtreeIfNeeded()
+            try? await Task.sleep(nanoseconds: 400_000_000)
+
+            let layers = Self.collectViews(PreviewClickLayerView.self, in: clickHost)
+            check("PV 真实点击：每块正文都盖了点击层", layers.count >= 2, "\(layers.count) 个")
+
+            func click(_ layer: PreviewClickLayerView, at point: CGPoint) {
+                let inWindow = layer.convert(point, to: nil)
+                guard let event = NSEvent.mouseEvent(with: .leftMouseDown,
+                                                     location: inWindow,
+                                                     modifierFlags: [],
+                                                     timestamp: ProcessInfo.processInfo.systemUptime,
+                                                     windowNumber: clickWindow.windowNumber,
+                                                     context: nil,
+                                                     eventNumber: 0,
+                                                     clickCount: 1,
+                                                     pressure: 1) else { return }
+                layer.mouseDown(with: event)
+            }
+
+            if layers.count >= 2 {
+                let paragraphLayer = layers[1]
+                let hitPoint = CGPoint(x: 30, y: max(3, paragraphLayer.bounds.midY))
+                click(paragraphLayer, at: hitPoint)
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+
+            let editors = Self.collectViews(NSTextView.self, in: clickHost).filter { $0.isEditable }
+            check("PV 真实点击：点正文后出现就地编辑器", editors.count == 1, "\(editors.count) 个")
+            check("PV 真实点击：编辑器里就是这一段的原文",
+                  editors.first?.string == "点击这一段文字就应该进入编辑。",
+                  editors.first?.string ?? "nil")
+
+            if let editor = editors.first {
+                editor.string = "点进来改成这一句。"
+                editor.delegate?.textDidChange?(Notification(name: NSText.didChangeNotification,
+                                                             object: editor))
+                clickWindow.makeFirstResponder(nil)   // 失焦 = 提交
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                check("PV 真实点击：改完的字写回了正文",
+                      clickTab.text.contains("点进来改成这一句。"),
+                      clickTab.text.replacingOccurrences(of: "\n", with: "⏎"))
+                check("PV 真实点击：提交后编辑器收起来了",
+                      Self.collectViews(NSTextView.self, in: clickHost).allSatisfy { !$0.isEditable },
+                      "还有可编辑文本视图")
+                check("PV 真实点击：只改了这一段，标题没动",
+                      clickTab.text.hasPrefix("# 标题"), clickTab.text.prefix(10).description)
+            }
+            clickWindow.contentView = nil
+        } else {
+            check("PV 真实点击：样例文档打开成功", false)
+        }
+
+        // 9.7.4 阅读模式就地编辑：标记识别 + 写回不丢格式
+        //
+        // 设计前提（ADR-22）：编辑框里放的是这一块的**原文**，标记画成透明而已。
+        // 所以写回永远是整段替换，不存在映射。这里要证的就是这句话：
+        // 排版层认得准（标记藏得掉），而且改字之后原来的格式还在。
+        let markupSample = "**粗体** 与 *斜体*，`code` 和 [链接](https://example.com)，还有 snake_case_name。"
+        let markupMap = PreviewInlineMap.build(markupSample)
+
+        func styles(of substring: String) -> [PreviewCharStyle] {
+            let range = (markupSample as NSString).range(of: substring)
+            guard range.location != NSNotFound else { return [] }
+            return (range.location..<NSMaxRange(range)).map { markupMap.styles[$0] }
+        }
+
+        check("PV 标记识别：`**` 被认成标记",
+              styles(of: "**").allSatisfy { $0.contains(.markup) },
+              "\(styles(of: "**").map(\.rawValue))")
+        check("PV 标记识别：`粗体` 被认成 strong",
+              styles(of: "粗体").allSatisfy { $0.contains(.strong) })
+        check("PV 标记识别：`斜体` 被认成 emphasis",
+              styles(of: "斜体").allSatisfy { $0.contains(.emphasis) })
+        check("PV 标记识别：行内代码内容是 code、反引号是标记",
+              styles(of: "code").allSatisfy { $0.contains(.code) }
+                && markupMap.styles[(markupSample as NSString).range(of: "`code`").location].contains(.markup))
+        check("PV 标记识别：链接 label 是 link、地址整段是标记",
+              styles(of: "链接").allSatisfy { $0.contains(.link) }
+                && markupMap.styles[(markupSample as NSString).range(of: "](https").location].contains(.markup))
+        check("PV 标记识别：链接地址被抓出来",
+              markupMap.links.first?.url == "https://example.com",
+              markupMap.links.first?.url ?? "nil")
+        check("PV 标记识别：词内下划线（snake_case）不当强调",
+              styles(of: "snake_case_name").allSatisfy { !$0.contains(.emphasis) && !$0.contains(.markup) },
+              "\(styles(of: "snake_case_name").map(\.rawValue))")
+
+        // 隐藏 = 换成 0.1pt 字体 + 透明色。不靠负字距：负字距会把后面的字拉过来叠着。
+        let plainAppearance = PreviewLiveStyler.Appearance(fontSize: 13)
+        let hiddenStyled = PreviewLiveStyler.attributed(markupMap, appearance: plainAppearance, caretLine: 99)
+        let hiddenFont = hiddenStyled.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        let shownStyled = PreviewLiveStyler.attributed(markupMap, appearance: plainAppearance, caretLine: 0)
+        let shownFont = shownStyled.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        check("PV 标记渲染：非光标行把标记压到 0.1pt",
+              (hiddenFont?.pointSize ?? 99) < 1, "\(hiddenFont?.pointSize ?? -1)pt")
+        check("PV 标记渲染：光标所在行标记重新显形",
+              abs((shownFont?.pointSize ?? 0) - 13) < 0.01, "\(shownFont?.pointSize ?? -1)pt")
+        check("PV 标记渲染：隐藏不改变字符本身（长度一致）",
+              hiddenStyled.length == (markupSample as NSString).length
+                && hiddenStyled.string == markupSample,
+              "\(hiddenStyled.length) vs \((markupSample as NSString).length)")
+
+        // 块级前缀（`- ` / `# ` / `> `）始终淡显：藏起来会连缩进一起吃掉
+        // "- 列表项\n- 第二项" 里，第二个 `-` 在第 6 个位置（前面是 "- 列表项" + 换行）
+        let listMap = PreviewInlineMap.build("- 列表项\n- 第二项")
+        check("PV 标记渲染：列表符号始终淡显、不隐藏",
+              listMap.styles[0].contains(.blockPrefix) && listMap.styles[6].contains(.blockPrefix),
+              "\(listMap.styles[0].rawValue) / \(listMap.styles[6].rawValue)")
+
+        // 点击落点 → 光标下标（纯排版计算，不依赖视图）
+        let probeText = "abcdef"
+        let probeStyled = PreviewLiveStyler.attributed(PreviewInlineMap.build(probeText),
+                                                       appearance: plainAppearance,
+                                                       caretLine: -1)
+        let startIndex = PreviewTextMetrics.caretIndex(probeStyled, width: 400, at: .zero)
+        let endIndex = PreviewTextMetrics.caretIndex(probeStyled, width: 400, at: CGPoint(x: 399, y: 1))
+        check("PV 光标落点：点在左上角落在行首", startIndex == 0, "\(startIndex)")
+        check("PV 光标落点：点在行尾空白处落在行尾",
+              endIndex == probeText.utf16.count, "\(endIndex)")
+
+        // 代码块只编辑围栏之间
+        let fenceBlock = "```swift\nlet a = 1\nlet b = 2\n```"
+        if let inner = PreviewSourceMap.codeInnerRange(in: fenceBlock) {
+            check("PV 代码块：就地编辑范围去掉上下围栏",
+                  (fenceBlock as NSString).substring(with: inner) == "let a = 1\nlet b = 2",
+                  (fenceBlock as NSString).substring(with: inner).debugDescription)
+        } else {
+            check("PV 代码块：算得出围栏内的区间", false)
+        }
+        if let unfenced = PreviewSourceMap.codeInnerRange(in: "let a = 1") {
+            check("PV 代码块：没围栏时不硬造区间", unfenced.length == 0, "\(unfenced.length)")
+        } else {
+            check("PV 代码块：没围栏时返回 nil（走整块）", true)
+        }
+
+        // 端到端：改一个字，原来的粗体标记必须原样留着
+        let boldFile = tempDirectory.appendingPathComponent("pv-bold.md")
+        try? "开头一段。\n\n这是 **粗体** 和 `code` 的段落。\n\n结尾一段。".write(to: boldFile,
+                                                                 atomically: true, encoding: .utf8)
+        let boldWorkspace = Workspace(settings: settings, restoreSessionOnInit: false)
+        boldWorkspace.open(url: boldFile)
+        for _ in 0..<30 {
+            if boldWorkspace.activeTab?.ast.blocks.count ?? 0 >= 3 { break }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        if let boldTab = boldWorkspace.activeTab,
+           boldTab.ast.blocks.count >= 3,
+           let range = PreviewSourceMap(text: boldTab.text)
+            .range(startLine: boldTab.ast.blocks[1].sourceLine,
+                   nextBlockLine: boldTab.ast.blocks[2].sourceLine) {
+            let source = (boldTab.text as NSString).substring(with: range)
+            check("PV 就地编辑：含格式的段落取到完整原文",
+                  source == "这是 **粗体** 和 `code` 的段落。", source)
+            let edited = source.replacingOccurrences(of: "这是", with: "这里是")
+            check("PV 就地编辑：写回成功", boldTab.replaceText(in: range, with: edited))
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            check("PV 就地编辑：改字之后粗体与行内代码标记原样保留",
+                  boldTab.text.contains("这里是 **粗体** 和 `code` 的段落。"),
+                  boldTab.text.replacingOccurrences(of: "\n", with: "⏎"))
+            check("PV 就地编辑：改完仍是「脏」状态", isDirty(boldTab), stateLabel(boldTab))
+        } else {
+            check("PV 就地编辑：含格式的样例文档打开成功", false)
+        }
+
+        // 视觉回归：就地编辑态的样子（整页快照里编辑态需要点击才出现，单独渲一次）
+        let editorProbe = NSHostingView(rootView: LivePreviewEditor(
+            text: "正文里的 **粗体** 和 `code` 标记在没光标时会被藏起来\n这一行是光标所在行：**标记** 和 `code` 重新显形",
+            appearance: PreviewLiveStyler.Appearance(fontSize: 14),
+            caretIndex: 60,
+            onTextChange: { _ in },
+            onSubmit: {},
+            onCancel: {},
+            onEndEditing: {},
+            onHeightChange: { _ in }
         ))
-        editorProbe.frame = NSRect(x: 0, y: 0, width: 760, height: 170)
+        editorProbe.frame = NSRect(x: 0, y: 0, width: 760, height: 64)
         editorProbe.layoutSubtreeIfNeeded()
+        try? await Task.sleep(nanoseconds: 200_000_000)
         snapshotView(editorProbe, to: "/tmp/swiftdown-preview-editor.png",
-                     size: NSSize(width: 760, height: 170))
-        check("PV 编辑框高度随内容（两行不能塌成一行）",
-              editorProbe.fittingSize.height > 60, "\(Int(editorProbe.fittingSize.height))pt")
+                     size: NSSize(width: 760, height: 64))
+        let mountedEditors = Self.collectViews(NSTextView.self, in: editorProbe)
+        check("PV 就地编辑：编辑态挂上了可编辑文本视图",
+              mountedEditors.contains { $0.isEditable && $0.string.hasPrefix("正文里的") },
+              "\(mountedEditors.count) 个文本视图")
+        check("PV 就地编辑：编辑态有实际排版高度",
+              (mountedEditors.first?.frame.height ?? 0) > 10,
+              "\(Int(mountedEditors.first?.frame.height ?? 0))pt")
 
         // 临目录清理交给 defer（中途 return 也会执行）
         // 清掉自检写入的专用设置域与会话目录。

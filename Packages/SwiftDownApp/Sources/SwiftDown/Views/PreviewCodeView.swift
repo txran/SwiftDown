@@ -38,6 +38,25 @@ final class PreviewCodeScrollView: NSScrollView {
     }
 }
 
+/// 代码块里的只读文本视图：双击交给外层进入就地编辑。
+///
+/// 为什么要有这一层：代码块里挂的是真正的 `NSTextView`（为了横向不换行 + 滚轮穿透），
+/// 鼠标事件会被它吃掉，SwiftUI 那边挂在块上的点击手势收不到。
+/// 所以在 AppKit 这一侧把「双击」接住，顺手把双击处的字符下标带出去，光标就落在双击的位置。
+final class CodeTextViewModel: NSTextView {
+    var onEditRequest: ((Int?) -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        if event.clickCount == 2, let onEditRequest {
+            let point = convert(event.locationInWindow, from: nil)
+            let index = characterIndexForInsertion(at: point)
+            onEditRequest(index)
+            return
+        }
+        super.mouseDown(with: event)
+    }
+}
+
 /// 只读、不换行、可选中复制的代码文本视图（`NSViewRepresentable` 包装）。
 ///
 /// 高度不用 `sizeThatFits` 反过来问 SwiftUI：那样要先 `updateNSView` 换文本、再让
@@ -48,6 +67,7 @@ struct CodeBlockText: NSViewRepresentable {
     let attributed: NSAttributedString
     let fontSize: CGFloat
     let inset: NSSize
+    var onEditRequest: ((Int?) -> Void)? = nil
 
     func makeNSView(context: Context) -> PreviewCodeScrollView {
         let scrollView = PreviewCodeScrollView()
@@ -58,7 +78,7 @@ struct CodeBlockText: NSViewRepresentable {
         scrollView.autohidesScrollers = true
         scrollView.scrollerStyle = .overlay
 
-        let textView = NSTextView(frame: .zero)
+        let textView = CodeTextViewModel(frame: .zero)
         textView.isEditable = false
         textView.isSelectable = true
         textView.drawsBackground = false
@@ -79,7 +99,8 @@ struct CodeBlockText: NSViewRepresentable {
     }
 
     func updateNSView(_ scrollView: PreviewCodeScrollView, context: Context) {
-        guard let textView = scrollView.documentView as? NSTextView else { return }
+        guard let textView = scrollView.documentView as? CodeTextViewModel else { return }
+        textView.onEditRequest = onEditRequest
         if textView.textStorage?.isEqual(to: attributed) != true {
             textView.textStorage?.setAttributedString(attributed)
             textView.setSelectedRange(NSRange(location: 0, length: 0))

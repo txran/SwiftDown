@@ -205,6 +205,12 @@ struct StatusBarView: View {
                     Text(String(format: "解析 %.0fms", tab.lastParseMilliseconds))
                         .foregroundStyle(tab.lastParseMilliseconds > 300 ? .orange : .secondary)
                 }
+                // 就地编辑没有任何按钮，得有一行字告诉用户「预览里能直接改」
+                if tab.canEdit, workspace.viewMode != .editor {
+                    Label("点正文即可编辑　⌘↩ 完成 · Esc 放弃", systemImage: "text.cursor")
+                        .labelStyle(.titleAndIcon)
+                        .foregroundStyle(.tertiary)
+                }
             } else {
                 Text("未打开文件")
             }

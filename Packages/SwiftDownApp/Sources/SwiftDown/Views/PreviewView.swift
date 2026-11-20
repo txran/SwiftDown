@@ -2,29 +2,67 @@ import AppKit
 import SwiftDownPipeline
 import SwiftUI
 
+extension View {
+    /// 两种 `TextSelectability` 是不同类型，三元表达式推不出来，只能分支写
+    @ViewBuilder
+    func previewTextSelection(enabled: Bool) -> some View {
+        if enabled {
+            textSelection(.enabled)
+        } else {
+            textSelection(.disabled)
+        }
+    }
+}
+
+/// 标题字号（预览渲染与就地编辑共用一套，否则点进编辑会「跳号」）
+enum PreviewTypography {
+    static func headingSize(_ level: Int, bodySize: CGFloat) -> CGFloat {
+        switch level {
+        case 1: return bodySize + 12
+        case 2: return bodySize + 8
+        case 3: return bodySize + 4
+        case 4: return bodySize + 1
+        default: return bodySize
+        }
+    }
+}
+
 /// 渲染预览（FR-02 / FR-03）。
 /// 按块渲染 + LazyVStack：只实例化视口内的块，这是 10MB 文档能滚动的关键（NFR-02）。
+///
+/// **阅读模式就地编辑**：点哪块、光标就落在哪，直接打字。
+/// 编辑框里放的是这一块的 **Markdown 原文**，标记（`**` / `` ` `` / `[..](..)`）画成透明，
+/// 内容画成渲染后的样子（粗体、斜体、行内代码、链接色），光标所在行的标记重新显形。
+/// 写回就是整段替换原文——不存在「渲染位置 ↔ 源位置」的映射，也就没有写坏格式的可能。
+/// 改样式（加粗、改标题层级、插链接）仍然去源码模式，预览里只改字。
 struct PreviewView: View {
 
     @ObservedObject var tab: DocumentTab
     let bodySize: CGFloat
 
-    /// 悬停在哪一块（块的起始行）。只有悬停的块才显示右上角的铅笔。
+    /// 悬停在哪一块（块的起始行）。只用来做很轻的底色提示 + I 形光标。
     /// 用 `LocalState` 而不是 `@State`：本机只有 CLT，SwiftUIMacros 插件缺失，`@State` 编不过。
     @StateObject private var hoveredLine = LocalState<Int?>(nil)
     /// 正在就地编辑的块；nil = 正常预览
-    @StateObject private var editing = LocalState<EditingBlock?>(nil)
-    /// 草稿放在这里而不是 `BlockSourceEditor` 内部：LazyVStack 会把滚出视口的行
-    /// 销毁重建，状态若挂在行上，滚一下草稿就没了。
-    @StateObject private var draft = LocalState("")
+    @StateObject private var editing = LocalState<EditSession?>(nil)
+    /// 草稿放这里而不是编辑框内部：LazyVStack 会把滚出视口的行销毁重建，
+    /// 状态若挂在行上，滚一下草稿就没了。
+    /// 用不带 `@Published` 的盒子：按键不触发整页重算（见 PreviewDraftBox）。
+    @StateObject private var draft = LocalState(PreviewDraftBox())
+    /// 编辑框当前高度（由文本视图量出来后回填）
+    @StateObject private var editorHeight = LocalState<CGFloat>(20)
+    /// 内容区宽度：把点击位置换算成字符下标要用它
+    @StateObject private var contentWidth = LocalState<CGFloat>(600)
 
     @Environment(\.undoManager) private var undoManager
 
-    private struct EditingBlock: Equatable {
+    struct EditSession {
         let line: Int
+        /// 要替换的源区间：普通块是整块，代码块是围栏之间
         let range: NSRange
-        let label: String
-        let original: String
+        let appearance: PreviewLiveStyler.Appearance
+        let source: String
+        let caret: Int
     }
 
     var body: some View {
@@ -43,6 +81,7 @@ struct PreviewView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: .textBackgroundColor))
+        .onDisappear { commitActive() }
     }
 
     private var content: some View {
@@ -54,10 +93,13 @@ struct PreviewView: View {
                             .id(Self.anchor(for: block))
                     }
                 }
+                .background(widthReader)
                 .padding(.horizontal, 28)
                 .padding(.vertical, 20)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .textSelection(.enabled)
+                // 可编辑时把系统选择层关掉：它会盖在正文上方把点击吃掉。
+                // 只读文档反过来——没法就地编辑，就把选中复制能力还给它。
+                .previewTextSelection(enabled: !tab.canEdit)
             }
             .onChange(of: tab.focusedLine) { newLine in
                 align(proxy: proxy, toLine: newLine, animated: true)
@@ -71,79 +113,179 @@ struct PreviewView: View {
         }
     }
 
+    private var widthReader: some View {
+        GeometryReader { proxy in
+            Color.clear
+                .onAppear { contentWidth.value = proxy.size.width }
+                .onChange(of: proxy.size.width) { width in contentWidth.value = width }
+        }
+    }
+
+    private func isCodeBlock(_ block: BlockNode) -> Bool {
+        if case .codeBlock = block { return true }
+        return false
+    }
+
     private func nextBlock(after index: Int) -> BlockNode? {
         let blocks = tab.ast.blocks
         let next = index + 1
         return blocks.indices.contains(next) ? blocks[next] : nil
     }
 
-    // MARK: - 一块：正常渲染 / 就地编辑
+    // MARK: - 一块：渲染 / 就地编辑
 
     @ViewBuilder
     private func blockRow(_ block: BlockNode, next: BlockNode?) -> some View {
-        if let active = editing.value, active.line == block.sourceLine {
-            BlockSourceEditor(label: active.label,
-                              fontSize: max(11, bodySize - 1),
-                              draft: $draft.value,
-                              onCommit: commitEdit,
-                              onCancel: { editing.value = nil })
+        if let session = editing.value, session.line == block.sourceLine {
+            LivePreviewEditor(
+                text: draft.value.text,
+                appearance: session.appearance,
+                caretIndex: session.caret,
+                onTextChange: { draft.value.text = $0 },
+                onSubmit: { commitActive() },
+                onCancel: { cancelActive() },
+                onEndEditing: { commitActive() },
+                onHeightChange: { height in editorHeight.value = max(18, height) }
+            )
+            .frame(height: max(18, editorHeight.value))
+            .background(editorBackground)
+            .padding(.vertical, -2)
         } else {
             BlockView(block: block,
                       baseDirectory: tab.url.deletingLastPathComponent(),
-                      bodySize: bodySize)
-                .overlay(alignment: .topTrailing) { editAffordance(block, next: next) }
-                .onHover { inside in
-                    if inside {
-                        hoveredLine.value = block.sourceLine
-                    } else if hoveredLine.value == block.sourceLine {
-                        hoveredLine.value = nil
+                      bodySize: bodySize,
+                      onEditRequest: tab.canEdit ? { caret in
+                          beginEdit(block, next: next, point: nil, caretOverride: caret)
+                      } : nil)
+                .background(rowHighlight(block))
+                // 代码块不给点击层：里面挂的是真 NSTextView（要能选中、要能横向滚），
+                // 盖一层就都废了；它靠双击进入编辑（见 CodeTextViewModel）。
+                .overlay {
+                    if !isCodeBlock(block) {
+                        PreviewClickLayer(isInteractive: tab.canEdit,
+                                          onTap: { point in handleTap(block, next: next, at: point) },
+                                          onHover: { inside in handleHover(inside, block: block) })
                     }
                 }
         }
     }
 
+    /// 很轻的悬停底色：告诉用户「这一块能点进去改」，但不要跳出一个按钮
     @ViewBuilder
-    private func editAffordance(_ block: BlockNode, next: BlockNode?) -> some View {
-        if tab.canEdit, editing.value == nil, hoveredLine.value == block.sourceLine {
-            Button {
-                beginEdit(block, next: next)
-            } label: {
-                Image(systemName: "pencil")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 20, height: 20)
-                    .background(Circle().fill(Color(nsColor: .controlBackgroundColor)))
-                    .overlay(Circle().stroke(Color(nsColor: .separatorColor), lineWidth: 0.6))
-            }
-            .buttonStyle(.plain)
-            .help("编辑这一块（从第 \(block.sourceLine) 行起的 Markdown 源码）")
-            .padding(2)
+    private func rowHighlight(_ block: BlockNode) -> some View {
+        RoundedRectangle(cornerRadius: 6)
+            .fill(Color.accentColor.opacity(tab.canEdit && hoveredLine.value == block.sourceLine ? 0.06 : 0))
+            .padding(.horizontal, -8)
+            .padding(.vertical, -2)
+    }
+
+    @ViewBuilder
+    private var editorBackground: some View {
+        RoundedRectangle(cornerRadius: 6)
+            .fill(Color.accentColor.opacity(0.07))
+            .padding(.horizontal, -8)
+            .padding(.vertical, -2)
+    }
+
+    private func handleHover(_ inside: Bool, block: BlockNode) {
+        if inside {
+            hoveredLine.value = block.sourceLine
+            if tab.canEdit { NSCursor.iBeam.set() }
+        } else {
+            if hoveredLine.value == block.sourceLine { hoveredLine.value = nil }
+            NSCursor.arrow.set()
         }
     }
 
-    // MARK: - 轻量编辑
+    // MARK: - 进入编辑
 
-    private func beginEdit(_ block: BlockNode, next: BlockNode?) {
-        let map = PreviewSourceMap(text: tab.text)
-        guard let range = map.range(startLine: block.sourceLine,
-                                    nextBlockLine: next?.sourceLine) else { return }
-        let source = map.text(in: range)
-        draft.value = source
-        editing.value = EditingBlock(line: block.sourceLine,
-                                     range: range,
-                                     label: map.lineLabel(for: range),
-                                     original: source)
-        hoveredLine.value = nil
+    private func handleTap(_ block: BlockNode, next: BlockNode?, at point: CGPoint) {
+        if let session = editing.value, session.line == block.sourceLine { return }
+
+        // 点在链接上就打开链接，别把人拽进编辑态
+        if let target = linkTarget(block: block, next: next, at: point) {
+            if let url = URL(string: target) { NSWorkspace.shared.open(url) }
+            return
+        }
+        beginEdit(block, next: next, point: point)
     }
 
-    private func commitEdit() {
-        guard let active = editing.value else { return }
-        editing.value = nil
-        guard draft.value != active.original else { return }
+    private func linkTarget(block: BlockNode, next: BlockNode?, at point: CGPoint) -> String? {
+        let map = PreviewSourceMap(text: tab.text)
+        guard contentWidth.value > 40,
+              let blockRange = map.range(startLine: block.sourceLine, nextBlockLine: next?.sourceLine)
+        else { return nil }
+        let source = map.text(in: blockRange)
+        let inline = PreviewInlineMap.build(source)
+        guard !inline.links.isEmpty else { return nil }
 
-        let inserted = draft.value
-        let original = active.original
-        let range = active.range
+        let attributed = PreviewLiveStyler.attributed(inline,
+                                                      appearance: appearance(for: block),
+                                                      caretLine: -1)
+        let index = PreviewTextMetrics.caretIndex(attributed, width: contentWidth.value, at: point)
+        return inline.links.first { NSLocationInRange(index, $0.range) }?.url
+    }
+
+    private func beginEdit(_ block: BlockNode,
+                           next: BlockNode?,
+                           point: CGPoint?,
+                           caretOverride: Int? = nil) {
+        guard tab.canEdit else { return }
+        if let session = editing.value, session.line == block.sourceLine { return }
+        commitActive()
+
+        let map = PreviewSourceMap(text: tab.text)
+        guard let blockRange = map.range(startLine: block.sourceLine,
+                                         nextBlockLine: next?.sourceLine) else { return }
+        let blockSource = map.text(in: blockRange)
+        guard !blockSource.isEmpty else { return }
+
+        var appearance = appearance(for: block)
+        var source = blockSource
+        var targetRange = blockRange
+
+        if case .codeBlock(let language, _, _) = block,
+           let inner = PreviewSourceMap.codeInnerRange(in: blockSource) {
+            // 代码块只编辑围栏之间：围栏留着，删行、回车都不会把它挤走
+            appearance.language = language
+            source = (blockSource as NSString).substring(with: inner)
+            targetRange = NSRange(location: blockRange.location + inner.location,
+                                  length: inner.length)
+        }
+
+        var caret = 0
+        if let caretOverride {
+            caret = caretOverride
+        } else if let point, contentWidth.value > 40 {
+            let inline = PreviewInlineMap.build(source)
+            let attributed = PreviewLiveStyler.attributed(inline, appearance: appearance, caretLine: -1)
+            caret = PreviewTextMetrics.caretIndex(attributed, width: contentWidth.value, at: point)
+        }
+        caret = min(max(0, caret), (source as NSString).length)
+
+        let measured = PreviewLiveStyler.attributed(PreviewInlineMap.build(source),
+                                                    appearance: appearance,
+                                                    caretLine: -1)
+        editorHeight.value = max(18, PreviewTextMetrics.height(measured, width: contentWidth.value))
+        draft.value.text = source
+        hoveredLine.value = nil
+        editing.value = EditSession(line: block.sourceLine,
+                                    range: targetRange,
+                                    appearance: appearance,
+                                    source: source,
+                                    caret: caret)
+    }
+
+    // MARK: - 提交 / 取消
+
+    private func commitActive() {
+        guard let session = editing.value else { return }
+        editing.value = nil
+        guard draft.value.text != session.source else { return }
+
+        let inserted = draft.value.text
+        let original = session.source
+        let range = session.range
 
         // 编辑期间正文可能被别处改过（拆分模式下用户能同时在左侧敲字）。
         // 区间处的原文若已不是当初那一份，宁可放弃写入，也不要把别人的改动冲掉。
@@ -154,7 +296,7 @@ struct PreviewView: View {
         guard tab.replaceText(in: range, with: inserted) else { return }
 
         // 纯预览模式没有编辑器，`NSTextView` 不会替我们登记撤销，自己补一步。
-        // 拆分模式下走的是 `insertText(_:replacementRange:)`，撤销已由编辑器处理。
+        // 拆分模式下走的是编辑器自己的编辑路径，撤销已由它处理。
         if tab.editorBridge == nil, let undoManager {
             let newRange = NSRange(location: range.location,
                                    length: (inserted as NSString).length)
@@ -164,6 +306,28 @@ struct PreviewView: View {
                 }
             }
             undoManager.setActionName("编辑预览")
+        }
+    }
+
+    private func cancelActive() {
+        editing.value = nil
+        hoveredLine.value = nil
+    }
+
+    // MARK: - 外观
+
+    private func appearance(for block: BlockNode) -> PreviewLiveStyler.Appearance {
+        switch block {
+        case .heading(let level, _, _):
+            return .init(fontSize: PreviewTypography.headingSize(level, bodySize: bodySize), bold: true)
+        case .codeBlock(let language, _, _):
+            return .init(fontSize: max(10, bodySize - 1), mono: true, language: language, lineSpacing: 0)
+        case .blockQuote:
+            return .init(fontSize: bodySize, secondary: true)
+        case .table, .htmlBlock, .fallback:
+            return .init(fontSize: max(10, bodySize - 1), mono: true, lineSpacing: 0)
+        default:
+            return .init(fontSize: bodySize)
         }
     }
 
@@ -214,11 +378,13 @@ struct BlockView: View {
     let block: BlockNode
     let baseDirectory: URL?
     let bodySize: CGFloat
+    /// 代码块双击进入编辑用；其它块由外层的手势负责
+    var onEditRequest: ((Int?) -> Void)? = nil
 
     var body: some View {
         switch block {
         case .heading(let level, let inlines, _):
-            Text(InlineRenderer.attributed(inlines, size: headingSize(level)))
+            Text(InlineRenderer.attributed(inlines, size: PreviewTypography.headingSize(level, bodySize: bodySize)))
                 .fontWeight(.bold)
                 .padding(.top, level <= 2 ? 10 : 4)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -227,7 +393,8 @@ struct BlockView: View {
             ParagraphView(inlines: inlines, baseDirectory: baseDirectory, bodySize: bodySize)
 
         case .codeBlock(let language, let code, _):
-            CodeBlockView(language: language, code: code, bodySize: bodySize)
+            CodeBlockView(language: language, code: code, bodySize: bodySize,
+                          onEditRequest: onEditRequest)
 
         case .list(let ordered, let start, let items, _):
             ListView(ordered: ordered, start: start, items: items,
@@ -274,16 +441,6 @@ struct BlockView: View {
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
-
-    private func headingSize(_ level: Int) -> CGFloat {
-        switch level {
-        case 1: return bodySize + 12
-        case 2: return bodySize + 8
-        case 3: return bodySize + 4
-        case 4: return bodySize + 1
-        default: return bodySize
         }
     }
 }
@@ -418,6 +575,7 @@ struct CodeBlockView: View {
     let language: String?
     let code: String
     let bodySize: CGFloat
+    var onEditRequest: ((Int?) -> Void)? = nil
 
     /// 代码块内边距（横向给滚动留呼吸，纵向与行对齐）
     private var codeInset: NSSize { NSSize(width: 12, height: 10) }
@@ -437,7 +595,8 @@ struct CodeBlockView: View {
             CodeBlockText(attributed: CodeHighlighter.highlightedNS(code, language: language,
                                                                   size: codeFontSize),
                           fontSize: codeFontSize,
-                          inset: codeInset)
+                          inset: codeInset,
+                          onEditRequest: onEditRequest)
                 .frame(height: CodeBlockText.height(for: code, fontSize: codeFontSize, inset: codeInset))
         }
         .background(Color(nsColor: .quaternaryLabelColor).opacity(0.22))

@@ -446,6 +446,83 @@ final class LocalState<Value>: ObservableObject {
 
 行为等价（视图重建时状态保持、值变触发刷新），代价是所有读写都要多点一个 `.value`。
 
+### 3.12 `.textSelection(.enabled)` 会盖一层吃掉点击的 NSView
+
+给 `Text` / 容器加 `.textSelection(.enabled)` 之后，预览里点文字看起来「点了没反应」，
+挂在上面的 `SpatialTapGesture` / `onTapGesture` 全都不触发。
+
+原因：SwiftUI 为了实现选择，在内容上方放了一个 `SelectionOverlay`
+（`AppKitPlatformViewHost<PlatformViewRepresentableAdaptor<SelectionOverlay>>` +
+`SelectionTextField`），它是**真的 NSView**。`hitTest` 命中的是它，不是你的块：
+
+```swift
+host.hitTest(point)   // → NSView frame=(0,0,900,113)  ← 就是选择层，不是你的视图
+```
+
+所以「点文字进编辑」这类交互和 `.textSelection(.enabled)` **不能共存**。
+取舍两种做法：
+
+1. 关掉选择，点一下进入编辑态（真文本视图），选中复制在编辑态里做；
+2. 保留选择，交互换成双击/修饰键——但选择层还会继续吃掉事件，多半也不生效。
+
+只读文档反过来：不能编辑时把 `.textSelection(.enabled)` 还给它。
+两种 `TextSelectability` 是不同类型，三元表达式推不出来，要分支写：
+
+```swift
+extension View {
+    @ViewBuilder
+    func previewTextSelection(enabled: Bool) -> some View {
+        if enabled { textSelection(.enabled) } else { textSelection(.disabled) }
+    }
+}
+```
+
+### 3.13 合成鼠标事件驱动不了 SwiftUI 手势
+
+想用 `window.sendEvent(event)` / `NSApp.postEvent` 造一个点击来自检 SwiftUI 交互，
+基本行不通：同一份代码（`ScrollView` + `LazyVStack` + `contentShape` + `SpatialTapGesture`）
+**在独立小应用里能触发，在这个应用的自检窗口里完全不响应**——key window 一致、
+`NSApp.isActive` 一致、窗口号有效、`hitTest` 也命中了视图，就是不动。
+`TapGesture` 一样不响应，所以不是 `SpatialTapGesture` 的问题。
+
+结论：**要验证的交互就别放在 SwiftUI 手势上**。做一层透明 `NSView` 接收 `mouseDown`：
+
+```swift
+final class ClickLayerView: NSView {
+    override var isFlipped: Bool { true }          // 与 SwiftUI 同为左上原点
+    var onTap: ((CGPoint) -> Void)?
+    override func mouseDown(with event: NSEvent) {
+        onTap?(convert(event.locationInWindow, from: nil))
+    }
+    override func scrollWheel(with event: NSEvent) {
+        enclosingScrollView()?.scrollWheel(with: event)   // 别把滚动也吃掉
+    }
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        isInteractive ? super.hitTest(point) : nil        // 只读时把事件让出去
+    }
+}
+```
+
+好处不只是「肯定能收到点击」，而是**自检里能直接对它调 `mouseDown(with:)`**，
+走的就是真人点下去的那条入口，不需要模拟器、不依赖手势框架。
+
+### 3.14 把标记「藏起来」不能用负字距
+
+做「渲染态编辑」（Markdown 标记透明、内容照常显示）时，想让标记宽度归零，
+很自然会写 `kern = -fontSize`。不行：负字距会把**后一个字**往左拉，
+`**粗体**` 会变成「粗」压在「*」上。
+
+正确做法是换一个极小的字号 + 透明色：
+
+```swift
+attrs[.font] = NSFont.systemFont(ofSize: 0.1)
+attrs[.foregroundColor] = NSColor.clear
+```
+
+行高由同一行里最高的字决定，所以 0.1pt 的字不会把行压扁。
+代价是光标能停在看不见的字符上——所以要么在光标行把标记显形（Obsidian 的做法），
+要么接受这个小毛病。
+
 
 ---
 
@@ -946,6 +1023,9 @@ func saveNow() {
 | 鼠标停在代码块/内嵌区域上滚轮不动 | 嵌套滚动容器吃掉了纵向 delta | 内层判主导轴，竖向交还外层（3.10） |
 | `@State` 报 `SwiftUIMacros ... could not be found` | CLT 环境缺宏插件 | `@StateObject` + `LocalState<Value>`（3.11） |
 | 合成滚轮/鼠标事件验过，真机手感还是不对 | 合成事件只能验路由，验不了连续事件与惯性 | 手感类结论实机确认，别拿合成事件当证据 |
+| 加了 `.textSelection(.enabled)` 后点文字没反应 | 选择层是盖在上面的真 NSView，吃掉了点击 | 关掉选择，或把交互挪到 NSView 层（3.12） |
+| 合成点击在小程序里能用、在应用里不响应 | `window.sendEvent` 驱动不了 SwiftUI 手势 | 交互落到 NSView，自检直接调 `mouseDown`（3.13） |
+| 藏标记用了 `kern = -fontSize`，文字叠在一起 | 负字距拉的是后一个字 | 极小字号 + 透明色（3.14） |
 
 ---
 

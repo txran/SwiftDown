@@ -1,6 +1,5 @@
 import AppKit
-import SwiftDownPipeline
-import SwiftUI
+import Foundation
 
 /// 预览块的「源文本区间」映射：把 AST 的顶层块换算回原文里的字符区间。
 ///
@@ -37,7 +36,7 @@ struct PreviewSourceMap {
         return ns.substring(with: range)
     }
 
-    /// 「第 12 行」/「第 12–15 行」，给编辑框标题用
+    /// 「第 12 行」/「第 12–15 行」，给提示与日志用
     func lineLabel(for range: NSRange) -> String {
         guard range.location >= 0, NSMaxRange(range) <= ns.length else { return "" }
         let startLine = FindEngine.lineNumber(at: range.location, lineStarts: lineStarts)
@@ -65,69 +64,40 @@ struct PreviewSourceMap {
         let body = ns.substring(with: NSRange(location: start, length: end - start))
         return body.trimmingCharacters(in: .whitespaces).isEmpty
     }
-}
 
-/// 预览里的「轻量编辑」：就地改这一块的 Markdown 源码，⌘↩ 提交，Esc 取消。
-///
-/// 刻意**不做**所见即所得：内联节点（粗体 / 链接 / 行内代码）到源区间的双向映射
-/// 要改解析器，一旦映射错位就会把格式写坏；而「编辑源码、整块替换」不会产生任何
-/// 语义上的魔法——用户在框里看到什么，原文里就正好是那一段。
-struct BlockSourceEditor: View {
+    /// 代码块里「围栏之间」的那段区间（相对块首）。
+    ///
+    /// 就地编辑代码块时不该让用户看见 ``` 围栏：编辑框里只放代码本身，
+    /// 写完再塞回围栏中间。这样删掉一行或者按回车都不会把围栏挤走。
+    static func codeInnerRange(in block: String) -> NSRange? {
+        let ns = block as NSString
+        guard ns.length > 0 else { return nil }
 
-    let label: String
-    let fontSize: CGFloat
-    @Binding var draft: String
-    let onCommit: () -> Void
-    let onCancel: () -> Void
+        var lineStart = 0
+        var lineEnd = 0
+        var contentsEnd = 0
+        ns.getLineStart(&lineStart, end: &lineEnd, contentsEnd: &contentsEnd,
+                        for: NSRange(location: 0, length: 0))
+        let firstLine = ns.substring(with: NSRange(location: lineStart,
+                                                   length: contentsEnd - lineStart))
+        let fence = firstLine.trimmingCharacters(in: .whitespaces)
+        guard fence.hasPrefix("```") || fence.hasPrefix("~~~") else { return nil }
+        guard lineEnd > 0, lineEnd < ns.length else { return NSRange(location: 0, length: 0) }
 
-    @FocusState private var focused: Bool
+        var lastStart = 0
+        var lastEnd = 0
+        var lastContentsEnd = 0
+        ns.getLineStart(&lastStart, end: &lastEnd, contentsEnd: &lastContentsEnd,
+                        for: NSRange(location: ns.length - 1, length: 0))
+        let lastLine = ns.substring(with: NSRange(location: lastStart,
+                                                  length: lastContentsEnd - lastStart))
+        let closing = lastLine.trimmingCharacters(in: .whitespaces)
 
-    private var editorHeight: CGFloat {
-        let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
-        let lineHeight = ceil(font.ascender - font.descender + font.leading)
-        let count = min(max(draft.components(separatedBy: "\n").count, 2), 16)
-        return CGFloat(count) * lineHeight + 16
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
-                Image(systemName: "pencil.line")
-                    .font(.system(size: 10))
-                    .foregroundStyle(Color.accentColor)
-                Text("编辑 \(label) 的 Markdown 源码")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                Spacer(minLength: 8)
-                Button("取消", action: onCancel)
-                    .controlSize(.small)
-                Button("完成", action: onCommit)
-                    .controlSize(.small)
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.return, modifiers: .command)
-            }
-
-            TextEditor(text: $draft)
-                .font(.system(size: fontSize, design: .monospaced))
-                .scrollContentBackground(.hidden)
-                .padding(6)
-                .frame(height: editorHeight)
-                .background(Color(nsColor: .textBackgroundColor))
-                .clipShape(RoundedRectangle(cornerRadius: 6))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6)
-                        .stroke(Color(nsColor: .separatorColor), lineWidth: 0.6)
-                )
-                .focused($focused)
+        var end = ns.length
+        if closing.hasPrefix("```") || closing.hasPrefix("~~~") {
+            end = max(lineEnd, lastStart - 1)   // 停在闭合围栏那一行前面的换行处
         }
-        .padding(10)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(0.06)))
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(Color.accentColor.opacity(0.35), lineWidth: 0.8)
-        )
-        // Esc 取消。放在容器上而不是输入框上：TextEditor 聚焦时 Esc 会沿响应链冒泡上来。
-        .onExitCommand(perform: onCancel)
-        .onAppear { focused = true }
+        guard end > lineEnd else { return NSRange(location: lineEnd, length: 0) }
+        return NSRange(location: lineEnd, length: end - lineEnd)
     }
 }
