@@ -31,8 +31,8 @@ enum PreviewTypography {
 /// 按块渲染 + LazyVStack：只实例化视口内的块，这是 10MB 文档能滚动的关键（NFR-02）。
 ///
 /// **阅读模式就地编辑**：点哪块、光标就落在哪，直接打字。
-/// 编辑框里放的是这一块的 **Markdown 原文**，标记（`**` / `` ` `` / `[..](..)`）画成透明，
-/// 内容画成渲染后的样子（粗体、斜体、行内代码、链接色），光标所在行的标记重新显形。
+/// 编辑框里放的是这一块的 **Markdown 原文**，但标记（`**` / `` ` `` / `[..](..)` / `# `）
+/// 全部画成透明，内容按渲染样式画——所以打字时看到的就是预览本身，不会「变成源码」。
 /// 写回就是整段替换原文——不存在「渲染位置 ↔ 源位置」的映射，也就没有写坏格式的可能。
 /// 改样式（加粗、改标题层级、插链接）仍然去源码模式，预览里只改字。
 struct PreviewView: View {
@@ -148,8 +148,10 @@ struct PreviewView: View {
                 onHeightChange: { height in editorHeight.value = max(18, height) }
             )
             .frame(height: max(18, editorHeight.value))
-            .background(editorBackground)
-            .padding(.vertical, -2)
+            // 不铺底色、不加边框：铺了就一眼看出「切进了编辑模式」。
+            // 编辑态要看起来和渲染态是同一个东西，只是多了个光标。
+            // 上留白必须和 BlockView 里的标题一致，否则点下去整页会往上跳一截。
+            .padding(.top, topSpacing(for: block))
         } else {
             BlockView(block: block,
                       baseDirectory: tab.url.deletingLastPathComponent(),
@@ -179,12 +181,12 @@ struct PreviewView: View {
             .padding(.vertical, -2)
     }
 
-    @ViewBuilder
-    private var editorBackground: some View {
-        RoundedRectangle(cornerRadius: 6)
-            .fill(Color.accentColor.opacity(0.07))
-            .padding(.horizontal, -8)
-            .padding(.vertical, -2)
+    /// 渲染态块的额外上留白（目前只有标题有）。编辑态照抄一份，块高才不会跳。
+    private func topSpacing(for block: BlockNode) -> CGFloat {
+        if case .heading(let level, _, _) = block {
+            return level <= 2 ? 10 : 4
+        }
+        return 0
     }
 
     private func handleHover(_ inside: Bool, block: BlockNode) {
@@ -219,9 +221,7 @@ struct PreviewView: View {
         let inline = PreviewInlineMap.build(source)
         guard !inline.links.isEmpty else { return nil }
 
-        let attributed = PreviewLiveStyler.attributed(inline,
-                                                      appearance: appearance(for: block),
-                                                      caretLine: -1)
+        let attributed = PreviewLiveStyler.attributed(inline, appearance: appearance(for: block))
         let index = PreviewTextMetrics.caretIndex(attributed, width: contentWidth.value, at: point)
         return inline.links.first { NSLocationInRange(index, $0.range) }?.url
     }
@@ -258,14 +258,13 @@ struct PreviewView: View {
             caret = caretOverride
         } else if let point, contentWidth.value > 40 {
             let inline = PreviewInlineMap.build(source)
-            let attributed = PreviewLiveStyler.attributed(inline, appearance: appearance, caretLine: -1)
+            let attributed = PreviewLiveStyler.attributed(inline, appearance: appearance)
             caret = PreviewTextMetrics.caretIndex(attributed, width: contentWidth.value, at: point)
         }
         caret = min(max(0, caret), (source as NSString).length)
 
         let measured = PreviewLiveStyler.attributed(PreviewInlineMap.build(source),
-                                                    appearance: appearance,
-                                                    caretLine: -1)
+                                                    appearance: appearance)
         editorHeight.value = max(18, PreviewTextMetrics.height(measured, width: contentWidth.value))
         draft.value.text = source
         hoveredLine.value = nil

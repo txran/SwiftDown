@@ -101,7 +101,9 @@ enum SelfTest {
                 .environmentObject(workspace))
             probe.frame = NSRect(x: 0, y: 0, width: 1180, height: 760)
             probe.layoutSubtreeIfNeeded()
-            let hasEditor = !collectTextViews(in: probe).isEmpty
+            // 只数「可编辑」的：预览里的代码块自己也挂只读 NSTextView，
+            // 不筛的话拿一份带代码块的样例跑自检就会误报「仅预览里有编辑器」。
+            let hasEditor = collectTextViews(in: probe).contains { $0.isEditable }
             let expectedEditor = mode != .preview
             check("视图构建 \(mode.label)", probe.frame.width > 0
                   && hasEditor == expectedEditor,
@@ -1267,31 +1269,61 @@ enum SelfTest {
 
         // 隐藏 = 换成 0.1pt 字体 + 透明色。不靠负字距：负字距会把后面的字拉过来叠着。
         let plainAppearance = PreviewLiveStyler.Appearance(fontSize: 13)
-        let hiddenStyled = PreviewLiveStyler.attributed(markupMap, appearance: plainAppearance, caretLine: 99)
-        let hiddenFont = hiddenStyled.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
-        let shownStyled = PreviewLiveStyler.attributed(markupMap, appearance: plainAppearance, caretLine: 0)
-        let shownFont = shownStyled.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
-        check("PV 标记渲染：非光标行把标记压到 0.1pt",
-              (hiddenFont?.pointSize ?? 99) < 1, "\(hiddenFont?.pointSize ?? -1)pt")
-        check("PV 标记渲染：光标所在行标记重新显形",
-              abs((shownFont?.pointSize ?? 0) - 13) < 0.01, "\(shownFont?.pointSize ?? -1)pt")
+        let styled = PreviewLiveStyler.attributed(markupMap, appearance: plainAppearance)
+        let markFont = styled.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        check("PV 标记渲染：标记压到 0.1pt（始终透明，不再按光标行显形）",
+              (markFont?.pointSize ?? 99) < 1, "\(markFont?.pointSize ?? -1)pt")
+        let strongFont = styled.attribute(.font,
+                                          at: (markupSample as NSString).range(of: "粗体").location,
+                                          effectiveRange: nil) as? NSFont
+        check("PV 标记渲染：被标记包住的内容仍按原字号画",
+              abs((strongFont?.pointSize ?? 0) - 13) < 0.01, "\(strongFont?.pointSize ?? -1)pt")
         check("PV 标记渲染：隐藏不改变字符本身（长度一致）",
-              hiddenStyled.length == (markupSample as NSString).length
-                && hiddenStyled.string == markupSample,
-              "\(hiddenStyled.length) vs \((markupSample as NSString).length)")
+              styled.length == (markupSample as NSString).length
+                && styled.string == markupSample,
+              "\(styled.length) vs \((markupSample as NSString).length)")
 
-        // 块级前缀（`- ` / `# ` / `> `）始终淡显：藏起来会连缩进一起吃掉
-        // "- 列表项\n- 第二项" 里，第二个 `-` 在第 6 个位置（前面是 "- 列表项" + 换行）
+        // 隐藏区间：编辑器靠它把光标推出标记（否则方向键会停在看不见的字符里）
+        let hiddenRanges = PreviewLiveStyler.hiddenRanges(markupMap)
+        let openMarkRange = (markupSample as NSString).range(of: "**")
+        check("PV 光标跳过：开头的 `**` 被算进隐藏区间",
+              hiddenRanges.contains { $0.location == openMarkRange.location
+                                        && $0.length == openMarkRange.length },
+              hiddenRanges.map { "\($0.location)+\($0.length)" }.joined(separator: " "))
+
+        // 块级前缀：标题井号隐藏（渲染态标题本来就没缩进）；
+        // 列表符号淡显（它同时是行首缩进，藏掉文字会整块左移）
         let listMap = PreviewInlineMap.build("- 列表项\n- 第二项")
-        check("PV 标记渲染：列表符号始终淡显、不隐藏",
+        check("PV 标记渲染：列表符号淡显、不隐藏",
               listMap.styles[0].contains(.blockPrefix) && listMap.styles[6].contains(.blockPrefix),
               "\(listMap.styles[0].rawValue) / \(listMap.styles[6].rawValue)")
+        check("PV 标记渲染：列表符号不算隐藏字符（光标能停在它上面）",
+              !PreviewLiveStyler.hiddenRanges(listMap).contains { $0.location == 0 },
+              PreviewLiveStyler.hiddenRanges(listMap).map { "\($0.location)+\($0.length)" }.joined(separator: " "))
+
+        let headingMap = PreviewInlineMap.build("## 阅读模式")
+        check("PV 标记渲染：标题井号被认成 headingPrefix",
+              headingMap.styles[0].contains(.headingPrefix) && headingMap.styles[2].contains(.headingPrefix),
+              "\(headingMap.styles[0].rawValue) / \(headingMap.styles[2].rawValue)")
+        let headingStyled = PreviewLiveStyler.attributed(headingMap,
+                                                        appearance: PreviewLiveStyler.Appearance(fontSize: 22,
+                                                                                                 bold: true))
+        let hashFont = headingStyled.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        let titleFont = headingStyled.attribute(.font, at: 3, effectiveRange: nil) as? NSFont
+        check("PV 标记渲染：标题井号透明、标题文字仍是标题字号",
+              (hashFont?.pointSize ?? 99) < 1 && abs((titleFont?.pointSize ?? 0) - 22) < 0.01,
+              "\(hashFont?.pointSize ?? -1) / \(titleFont?.pointSize ?? -1)")
+
+        // 纯图片段落整段都是标记：这时候不能藏，否则点进去是个空框
+        let imageMap = PreviewInlineMap.build("![](pic.png)")
+        check("PV 标记渲染：整块只有标记时改为淡显（不留下空框）",
+              PreviewLiveStyler.hiddenRanges(imageMap).isEmpty,
+              "\(PreviewLiveStyler.hiddenRanges(imageMap).count) 段隐藏")
 
         // 点击落点 → 光标下标（纯排版计算，不依赖视图）
         let probeText = "abcdef"
         let probeStyled = PreviewLiveStyler.attributed(PreviewInlineMap.build(probeText),
-                                                       appearance: plainAppearance,
-                                                       caretLine: -1)
+                                                       appearance: plainAppearance)
         let startIndex = PreviewTextMetrics.caretIndex(probeStyled, width: 400, at: .zero)
         let endIndex = PreviewTextMetrics.caretIndex(probeStyled, width: 400, at: CGPoint(x: 399, y: 1))
         check("PV 光标落点：点在左上角落在行首", startIndex == 0, "\(startIndex)")
@@ -1342,11 +1374,61 @@ enum SelfTest {
             check("PV 就地编辑：含格式的样例文档打开成功", false)
         }
 
+        // 「点下去整页跳一下」也是切换感的一大来源：编辑态的高度必须和渲染态一致。
+        // 标题块在 BlockView 里多一段上留白，编辑态得照着补，否则会矮 10pt。
+        // 「点下去整页跳一下」也是切换感的一大来源：编辑态的高度必须和渲染态一致。
+        // 标题块在 BlockView 里多一段上留白，编辑态得照着补，否则会矮 10pt。
+        // 用一份专门的文档来量：`tab` 在前面几轮里已经被改过内容了。
+        let heightFile = tempDirectory.appendingPathComponent("pv-heading-height.md")
+        try? "# 阅读模式\n\n正文一段。\n".write(to: heightFile, atomically: true, encoding: .utf8)
+        let heightWorkspace = Workspace(settings: settings, restoreSessionOnInit: false)
+        heightWorkspace.open(url: heightFile)
+        for _ in 0..<30 {
+            if heightWorkspace.activeTab?.ast.blocks.count ?? 0 >= 2 { break }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        if let heightTab = heightWorkspace.activeTab,
+           heightTab.ast.blocks.count >= 2,
+           let headBlock = heightTab.ast.blocks.first(where: {
+               if case .heading = $0 { return true } else { return false }
+           }),
+           let headRange = PreviewSourceMap(text: heightTab.text)
+            .range(startLine: headBlock.sourceLine,
+                   nextBlockLine: heightTab.ast.blocks[1].sourceLine) {
+            let headSource = (heightTab.text as NSString).substring(with: headRange)
+            var headAppearance = PreviewLiveStyler.Appearance(fontSize: 14)
+            var topPadding: CGFloat = 0
+            if case .heading(let level, _, _) = headBlock {
+                headAppearance = .init(fontSize: PreviewTypography.headingSize(level, bodySize: 14),
+                                       bold: true)
+                topPadding = level <= 2 ? 10 : 4
+            }
+            let probeWidth: CGFloat = 600
+            let measuredHeight = PreviewTextMetrics.height(
+                PreviewLiveStyler.attributed(PreviewInlineMap.build(headSource),
+                                             appearance: headAppearance),
+                width: probeWidth) + topPadding
+            let renderProbe = NSHostingView(rootView: BlockView(block: headBlock,
+                                                                baseDirectory: nil,
+                                                                bodySize: 14))
+            renderProbe.frame = NSRect(x: 0, y: 0, width: probeWidth, height: 200)
+            renderProbe.layoutSubtreeIfNeeded()
+            let renderedHeight = renderProbe.fittingSize.height
+            // 容差 5：中文 26pt 会被替换成 PingFangUIDisplaySC（行高 26），
+            // SwiftUI 那边按西文字体算 30，这 4pt 是字体替换差，不是留白漏了。
+            // 真正的回归（标题少补 10pt 上留白）会差到 10pt 以上，照样抓得住。
+            check("PV 编辑态：标题块进编辑前后高度一致（不会整页跳一下）",
+                  abs(renderedHeight - measuredHeight) < 5,
+                  String(format: "渲染 %.1f / 编辑 %.1f", renderedHeight, measuredHeight))
+        } else {
+            check("PV 编辑态：拿到标题块用于高度对比", false)
+        }
+
         // 视觉回归：就地编辑态的样子（整页快照里编辑态需要点击才出现，单独渲一次）
         let editorProbe = NSHostingView(rootView: LivePreviewEditor(
-            text: "正文里的 **粗体** 和 `code` 标记在没光标时会被藏起来\n这一行是光标所在行：**标记** 和 `code` 重新显形",
+            text: "正文里的 **粗体** 和 `code` 点进来就是排版后的样子\n改字时看不见标记字符，光标也进不去",
             appearance: PreviewLiveStyler.Appearance(fontSize: 14),
-            caretIndex: 60,
+            caretIndex: 12,
             onTextChange: { _ in },
             onSubmit: {},
             onCancel: {},
@@ -1365,6 +1447,21 @@ enum SelfTest {
         check("PV 就地编辑：编辑态有实际排版高度",
               (mountedEditors.first?.frame.height ?? 0) > 10,
               "\(Int(mountedEditors.first?.frame.height ?? 0))pt")
+
+        // 真文本视图里验证「光标进不去隐藏标记」：这是「看起来不是源码」的前提
+        if let editor = mountedEditors.first(where: { $0.isEditable }) {
+            let map = PreviewInlineMap.build(editor.string)
+            if let firstMark = PreviewLiveStyler.hiddenRanges(map).first {
+                editor.setSelectedRange(NSRange(location: firstMark.location + 1, length: 0))
+                try? await Task.sleep(nanoseconds: 150_000_000)
+                let landed = editor.selectedRange().location
+                check("PV 光标跳过：落在隐藏标记内部的光标被推到边界",
+                      landed == NSMaxRange(firstMark) || landed == firstMark.location,
+                      "\(landed)，区间 \(firstMark.location)+\(firstMark.length)")
+            } else {
+                check("PV 光标跳过：样例里算得出隐藏区间", false)
+            }
+        }
 
         // 临目录清理交给 defer（中途 return 也会执行）
         // 清掉自检写入的专用设置域与会话目录。

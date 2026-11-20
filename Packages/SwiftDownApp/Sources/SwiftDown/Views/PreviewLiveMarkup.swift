@@ -6,10 +6,15 @@ struct PreviewCharStyle: OptionSet, Equatable {
     let rawValue: UInt8
     init(rawValue: UInt8) { self.rawValue = rawValue }
 
-    /// 块级前缀：`#` / `>` / `-` / `1.` / `[ ]`。**始终淡显**——
-    /// 把它藏起来会连列表的缩进一起吃掉，行首位置就会跳，反而更乱。
+    /// 列表 / 引用 / 任务框的前缀：`>` `-` `1.` `[ ]`。**淡显而不是隐藏**——
+    /// 它同时充当行首缩进（渲染态的项目符号、引用竖条就占这个位置），
+    /// 藏掉会让这一行文字整块左移，点进编辑先「跳一下」比多一个淡符号更难受。
     static let blockPrefix = PreviewCharStyle(rawValue: 1 << 0)
-    /// 行内标记：`**` `_` `~~` `` ` `` `[` `](url)`。**只在光标行显形**，其余行隐藏。
+    /// 标题的井号（`#`~`######`）：**隐藏**。渲染态标题本来就没有缩进，
+    /// 藏掉它文字的起点才和预览对齐，也才不会看起来像「切到了源码」。
+    static let headingPrefix = PreviewCharStyle(rawValue: 1 << 7)
+    /// 行内标记：`**` `_` `~~` `` ` `` `[` `](url)`。**始终隐藏**——
+    /// 光标行也不显形（见 `PreviewLiveStyler`）。要在预览里改格式请回源码模式。
     static let markup = PreviewCharStyle(rawValue: 1 << 1)
     static let strong = PreviewCharStyle(rawValue: 1 << 2)
     static let emphasis = PreviewCharStyle(rawValue: 1 << 3)
@@ -70,8 +75,9 @@ struct PreviewInlineMap {
 
         for line in lineRanges {
             let prefix = prefixLength(chars, line)
-            mark(&styles, utf16, line.lowerBound, line.lowerBound + prefix, .blockPrefix)
-            scanInline(chars, (line.lowerBound + prefix)..<line.upperBound, &styles, &links, utf16)
+            mark(&styles, utf16, line.lowerBound, line.lowerBound + prefix.length,
+                 prefix.isHeading ? .headingPrefix : .blockPrefix)
+            scanInline(chars, (line.lowerBound + prefix.length)..<line.upperBound, &styles, &links, utf16)
         }
 
         return PreviewInlineMap(text: text,
@@ -82,8 +88,10 @@ struct PreviewInlineMap {
 
     // MARK: - 块级前缀
 
-    /// 行首的块级标记长度：前导空白 + 引用号 + 标题井号 / 列表符号 / 任务框
-    private static func prefixLength(_ chars: [Character], _ line: Range<Int>) -> Int {
+    /// 行首的块级标记：前导空白 + 引用号 + 标题井号 / 列表符号 / 任务框。
+    /// 返回长度，以及它是不是「标题井号」（决定隐藏还是淡显）。
+    private static func prefixLength(_ chars: [Character],
+                                     _ line: Range<Int>) -> (length: Int, isHeading: Bool) {
         let start = line.lowerBound
         var i = start
         while i < line.upperBound, chars[i] == " " || chars[i] == "\t" { i += 1 }
@@ -96,7 +104,9 @@ struct PreviewInlineMap {
         if i < line.upperBound, chars[i] == "#" {
             var j = i
             while j < line.upperBound, chars[j] == "#" { j += 1 }
-            if j - i <= 6, j < line.upperBound, chars[j] == " " { return j + 1 - start }
+            if j - i <= 6, j < line.upperBound, chars[j] == " " {
+                return (j + 1 - start, true)
+            }
         }
 
         if i < line.upperBound, "-*+".contains(chars[i]),
@@ -115,7 +125,7 @@ struct PreviewInlineMap {
            " xX".contains(chars[i + 1]), chars[i + 2] == "]", chars[i + 3] == " " {
             i += 4
         }
-        return i - start
+        return (i - start, false)
     }
 
     // MARK: - 行内
@@ -339,16 +349,20 @@ enum PreviewLiveStyler {
         appearance.secondary ? .secondaryLabelColor : .labelColor
     }
 
-    static func attributed(_ map: PreviewInlineMap,
-                           appearance: Appearance,
-                           caretLine: Int) -> NSAttributedString {
+    /// 生成「看起来就是排版结果」的富文本。
+    ///
+    /// 这里**不看光标在哪**：标记一律隐藏。早先的版本让光标所在行把标记显形，
+    /// 结果点一下单行块（标题、单行段落）整块就变回源码，用户的感受是「切到源码模式了」，
+    /// 而不是「在预览里改字」。既然格式本来就约定去源码模式改，预览里就没必要露标记。
+    /// 隐藏掉的字符由 `hiddenRanges(_:)` 交给编辑器做光标跳过。
+    static func attributed(_ map: PreviewInlineMap, appearance: Appearance) -> NSAttributedString {
         if appearance.mono {
             return monoAttributed(map.text, appearance: appearance)
         }
 
         // 整块都被标记吃光时（典型：只有一个 `![](img.png)` 的段落）不能把标记藏起来，
         // 否则点进去是个空框，用户既看不到东西也没法判断自己在改什么。
-        let hideMarkup = map.styles.contains { !$0.contains(.markup) }
+        let allMarkup = isAllMarkup(map)
 
         let baseFont = baseFont(appearance)
         let baseColor = baseColor(appearance)
@@ -357,7 +371,7 @@ enum PreviewLiveStyler {
 
         let result = NSMutableAttributedString()
         var runStart = 0
-        var runKey = key(map, at: 0, caretLine: caretLine, hideMarkup: hideMarkup)
+        var runKey = key(map, at: 0, allMarkup: allMarkup)
 
         func flush(_ end: Int) {
             guard end > runStart else { return }
@@ -372,7 +386,7 @@ enum PreviewLiveStyler {
         }
 
         for index in 1..<max(1, map.styles.count) {
-            let next = key(map, at: index, caretLine: caretLine, hideMarkup: hideMarkup)
+            let next = key(map, at: index, allMarkup: allMarkup)
             if next != runKey {
                 flush(index)
                 runStart = index
@@ -381,6 +395,36 @@ enum PreviewLiveStyler {
         }
         flush(map.styles.count)
         return result
+    }
+
+    /// 整块只有标记、没有可见内容（纯图片段落）。
+    private static func isAllMarkup(_ map: PreviewInlineMap) -> Bool {
+        !map.styles.isEmpty && map.styles.allSatisfy { $0.contains(.markup) }
+    }
+
+    /// 会被画成透明的字符区间（连续的合并成一段）。编辑器拿它来做光标跳过——
+    /// 看不见的字符不应该能点进去、也不应该被退格删掉。
+    static func hiddenRanges(_ map: PreviewInlineMap) -> [NSRange] {
+        let allMarkup = isAllMarkup(map)
+        var ranges: [NSRange] = []
+        var start: Int?
+        for index in 0...map.styles.count {
+            let hidden = index < map.styles.count
+                && isHidden(map.styles[index], allMarkup: allMarkup)
+            if hidden {
+                if start == nil { start = index }
+            } else if let from = start {
+                ranges.append(NSRange(location: from, length: index - from))
+                start = nil
+            }
+        }
+        return ranges
+    }
+
+    static func isHidden(_ style: PreviewCharStyle, allMarkup: Bool) -> Bool {
+        if style.contains(.headingPrefix) { return true }
+        if style.contains(.markup) { return !allMarkup }
+        return false
     }
 
     private static func monoAttributed(_ text: String, appearance: Appearance) -> NSAttributedString {
@@ -400,21 +444,18 @@ enum PreviewLiveStyler {
 
     private enum RunKey: Equatable {
         case hidden
-        case dimmed
+        /// 块级前缀：淡显，但不再抢眼（比 tertiary 还淡一档）
+        case marker
         case content(PreviewCharStyle)
     }
 
     private static func key(_ map: PreviewInlineMap,
                             at index: Int,
-                            caretLine: Int,
-                            hideMarkup: Bool) -> RunKey {
+                            allMarkup: Bool) -> RunKey {
         guard index < map.styles.count else { return .content([]) }
         let style = map.styles[index]
-        if style.contains(.blockPrefix) { return .dimmed }
-        if style.contains(.markup) {
-            guard hideMarkup else { return .dimmed }
-            return map.lineIndex(at: index) == caretLine ? .dimmed : .hidden
-        }
+        if isHidden(style, allMarkup: allMarkup) { return .hidden }
+        if style.contains(.blockPrefix) { return .marker }
         return .content(style)
     }
 
@@ -429,9 +470,10 @@ enum PreviewLiveStyler {
                     .foregroundColor: NSColor.clear,
                     .paragraphStyle: paragraph]
 
-        case .dimmed:
+        case .marker:
+            // 字号与正文一致：换字号会连行高一起改，进编辑时整块高度就跳了
             return [.font: baseFont,
-                    .foregroundColor: NSColor.tertiaryLabelColor,
+                    .foregroundColor: NSColor.quaternaryLabelColor,
                     .paragraphStyle: paragraph]
 
         case .content(let style):
@@ -470,12 +512,51 @@ enum PreviewLiveStyler {
 /// 这样不需要等 `NSView` 布局完就能算，自检里也能直接断言。
 enum PreviewTextMetrics {
 
+    /// 逐行的「行片」高度求和。
+    ///
+    /// 不用 `usedRect`：那是所有字形外接框的并集，量的是「字画到哪」，
+    /// 而块高要的是「行占多高」。两者在纯中文行上会差一截（没有下伸部），
+    /// 行距也不在 `usedRect` 的口径里——多行段落会少算。
     static func height(_ attributed: NSAttributedString, width: CGFloat) -> CGFloat {
         let (storage, manager, container) = layout(attributed, width: width)
         manager.ensureLayout(for: container)
-        let used = manager.usedRect(for: container)
+        let total = lineHeight(manager: manager, container: container, storage: storage)
         withExtendedLifetime(storage) {}
-        return ceil(used.height)
+        return total
+    }
+
+    /// 一个已经排好版的文本视图，走同一套口径（编辑器回报高度用）
+    static func height(of textView: NSTextView) -> CGFloat {
+        guard let manager = textView.layoutManager,
+              let container = textView.textContainer,
+              let storage = textView.textStorage else { return 0 }
+        manager.ensureLayout(for: container)
+        return lineHeight(manager: manager, container: container, storage: storage)
+    }
+
+    private static func lineHeight(manager: NSLayoutManager,
+                                   container: NSTextContainer,
+                                   storage: NSTextStorage) -> CGFloat {
+        let glyphRange = manager.glyphRange(for: container)
+        guard glyphRange.length > 0 else { return 0 }
+        var total: CGFloat = 0
+        var index = glyphRange.location
+        while index < NSMaxRange(glyphRange) {
+            var lineRange = NSRange(location: 0, length: 0)
+            let fragment = manager.lineFragmentRect(forGlyphAt: index, effectiveRange: &lineRange)
+            total += fragment.height
+            // 行距只加在换行处（最后一行后面不加，否则底部会多出一段空白）
+            let charIndex = min(manager.characterIndexForGlyph(at: index),
+                                max(0, storage.length - 1))
+            if NSMaxRange(lineRange) < NSMaxRange(glyphRange),
+               let style = storage.attribute(.paragraphStyle, at: charIndex, effectiveRange: nil)
+                as? NSParagraphStyle {
+                total += style.lineSpacing
+            }
+            if lineRange.length == 0 { break }
+            index = NSMaxRange(lineRange)
+        }
+        return ceil(total)
     }
 
     /// 点（左上原点）→ 字符下标（UTF-16）。落在字的右半边就放到字后面。

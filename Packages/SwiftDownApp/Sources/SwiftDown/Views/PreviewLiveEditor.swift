@@ -114,13 +114,16 @@ struct LivePreviewEditor: NSViewRepresentable {
         var parent: LivePreviewEditor
         private weak var textView: LivePreviewTextView?
         private var appliedAppearance: PreviewLiveStyler.Appearance?
-        private var appliedCaretLine = Int.min
         private var lastReportedHeight: CGFloat = -1
         private var mounted = false
         private var cachedText = ""
         private var cachedMapValue: PreviewInlineMap?
         /// 自己改属性时不要触发 `textDidChange` 的回写
         private var styling = false
+        /// 光标跳过隐藏标记时防重入（`setSelectedRange` 会再进来一次）
+        private var skipping = false
+        /// 上一次的光标位置：决定跳过时把光标推到区间左端还是右端
+        private var previousCaret = -1
 
         init(_ parent: LivePreviewEditor) {
             self.parent = parent
@@ -129,9 +132,10 @@ struct LivePreviewEditor: NSViewRepresentable {
         func mount(_ view: LivePreviewTextView) {
             textView = view
             view.string = parent.text
-            let caret = clamp(parent.caretIndex)
+            let caret = skipHidden(clamp(parent.caretIndex), forward: true)
             view.setSelectedRange(NSRange(location: caret, length: 0))
-            restyle(caretLocation: caret)
+            previousCaret = caret
+            restyle()
             mounted = true
             reportHeight()
         }
@@ -143,9 +147,9 @@ struct LivePreviewEditor: NSViewRepresentable {
                 view.string = parent.text
                 let length = (view.string as NSString).length
                 view.setSelectedRange(NSRange(location: min(selection.location, length), length: 0))
-                restyle(caretLocation: view.selectedRange().location)
+                restyle()
             } else if appliedAppearance != parent.appearance {
-                restyle(caretLocation: view.selectedRange().location)
+                restyle()
             }
             reportHeight()
         }
@@ -156,15 +160,12 @@ struct LivePreviewEditor: NSViewRepresentable {
 
         // MARK: 刷新样式
 
-        private func restyle(caretLocation: Int) {
+        private func restyle() {
             guard let textView, let storage = textView.textStorage else { return }
             if textView.hasMarkedText() { return }   // 输入法组合中，别动属性
 
             let map = cachedMap(for: textView.string)
-            let caretLine = map.lineIndex(at: min(max(0, caretLocation), max(0, storage.length - 1)))
-            let attributed = PreviewLiveStyler.attributed(map,
-                                                          appearance: parent.appearance,
-                                                          caretLine: caretLine)
+            let attributed = PreviewLiveStyler.attributed(map, appearance: parent.appearance)
 
             styling = true
             let selection = textView.selectedRange()
@@ -192,7 +193,6 @@ struct LivePreviewEditor: NSViewRepresentable {
             styling = false
 
             appliedAppearance = parent.appearance
-            appliedCaretLine = caretLine
         }
 
         /// 每次按键都要重算，但一次改动里会被问好几遍，按字符串缓存一份
@@ -205,11 +205,9 @@ struct LivePreviewEditor: NSViewRepresentable {
         }
 
         private func reportHeight() {
-            guard let textView,
-                  let container = textView.textContainer,
-                  let layoutManager = textView.layoutManager else { return }
-            layoutManager.ensureLayout(for: container)
-            let height = ceil(layoutManager.usedRect(for: container).height) + 1
+            guard let textView else { return }
+            // 和 PreviewTextMetrics 同一口径：拿行片高度，不拿字形外接框
+            let height = PreviewTextMetrics.height(of: textView) + 1
             // 必须去重：这里每帧都会被调，不去重就会「设状态 → 重算 → 设状态」无限循环
             guard abs(height - lastReportedHeight) > 0.5 else { return }
             lastReportedHeight = height
@@ -223,18 +221,45 @@ struct LivePreviewEditor: NSViewRepresentable {
         func textDidChange(_ notification: Notification) {
             guard !styling, let textView, textView.hasMarkedText() == false else { return }
             parent.onTextChange(textView.string)
-            restyle(caretLocation: textView.selectedRange().location)
+            restyle()
             reportHeight()
         }
 
+        /// 光标不能停在看不见的标记里。
+        ///
+        /// 标记被画成 0.1pt 透明之后，位置仍然存在：方向键能进去、点进去更是一片空白，
+        /// 退格还会把 `**` 删掉一半。所以只要落点严格落在隐藏区间内部，
+        /// 就按移动方向推到区间边界——用户感知到的就是「标记根本不存在」。
         func textViewDidChangeSelection(_ notification: Notification) {
-            guard let textView, mounted else { return }
-            let caret = textView.selectedRange().location
-            let line = cachedMap(for: textView.string).lineIndex(at: max(0, caret))
-            // 只有换了行才需要重画（光标所在行的标记要显形）
-            if line != appliedCaretLine {
-                restyle(caretLocation: caret)
+            guard let textView, mounted, !styling else { return }
+            let selection = textView.selectedRange()
+            guard selection.length == 0 else {
+                previousCaret = selection.location
+                return
             }
+            if skipping {
+                previousCaret = selection.location
+                return
+            }
+            let caret = selection.location
+            let target = skipHidden(caret, forward: caret > previousCaret)
+            if target != caret {
+                skipping = true
+                textView.setSelectedRange(NSRange(location: target, length: 0))
+                skipping = false
+            }
+            previousCaret = target
+        }
+
+        /// 把落在隐藏区间内部的下标推到边界；不在区间里就原样返回。
+        private func skipHidden(_ caret: Int, forward: Bool) -> Int {
+            guard !parent.appearance.mono else { return caret }
+            let map = cachedMap(for: parent.text)
+            for range in PreviewLiveStyler.hiddenRanges(map)
+            where caret > range.location && caret < NSMaxRange(range) {
+                return forward ? NSMaxRange(range) : range.location
+            }
+            return caret
         }
 
         func textDidEndEditing(_ notification: Notification) {
