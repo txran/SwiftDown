@@ -46,6 +46,20 @@ hdiutil create \
 
 echo "✓ 完成："
 ls -lh "$DIST" | tail -n +2 | awk '{print "  " $9 "  " $5}'
+
+# 打完包就把开发产物清掉。
+#
+# 这一步不是洁癖：`build/.dev/SwiftDown.app` 用的是**正式身份**（SWIFTDOWN_DIST=1），
+# 和 /Applications 里那份 bundle id 完全一样。只要它还躺在磁盘上，
+# LaunchServices 就会把它当成「同一个应用的另一个拷贝」，启动台/聚焦并排出现两个 SwiftDown。
+# 之前只在 build-app.sh clean 里清理，导致每次打包完都会多出一份，直到下次 clean 才消失。
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+"$LSREGISTER" -u "$APP" >/dev/null 2>&1 || true
+"$LSREGISTER" -u "$ROOT/build/SwiftDown.app" >/dev/null 2>&1 || true
+rm -rf "$APP" "$ROOT/build/SwiftDown.app" 2>/dev/null || true
+killall Dock 2>/dev/null || true
+echo
+echo "  已清理 build/.dev（同身份的副本会让启动台出现两个 SwiftDown）"
 echo
 echo "  首次打开（未签名提示）可执行："
 echo "    xattr -dr com.apple.quarantine \"/Applications/SwiftDown.app\""
